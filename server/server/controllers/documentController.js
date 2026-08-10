@@ -1,5 +1,5 @@
-const Document = require('../models/Document'); // 假设你有一个文档模型
 const { v4: uuidv4 } = require('uuid');
+const Document = require('../models/Document');
 
 class DocumentController {
     // 获取文档列表
@@ -8,10 +8,11 @@ class DocumentController {
           const { userId, query, pagenum, pagesize } = req.query;
           const document = await Document.findOne({ userId });
           if (document) {
-            // 查询条件示例
+            // 查询条件：必须按 userId 过滤，防止越权查看他人文档
             const condition = {};
-      
-            // 如果有查询参数 query，可以根据需要设置查询条件
+            if (userId) {
+              condition.userId = userId;
+            }
             if (query) {
               condition.documentName = { $regex: query, $options: 'i' };
             }
@@ -156,9 +157,6 @@ class DocumentController {
           });
         }
     }
-      
-    
-      
 }
 
 module.exports = new DocumentController();

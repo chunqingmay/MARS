@@ -9,6 +9,10 @@ export const ComponentTypes = {
   LAYER: 'layer',
   MATERIAL: 'material',
   VIEW_REPRESENTATION: 'viewRepresentation',
+  MESH_VIEW: 'meshView',
+  VOXEL_VIEW: 'voxelView',
+  CLOUD_POINT_VIEW: 'cloudPointView',
+  ACTIVE_VIEW: 'activeView',
   COLLIDER: 'collider',
   CHILDREN: 'children',
   PARENT: 'parent',
@@ -77,6 +81,41 @@ export function createViewRepresentationComponent() {
   }
 }
 
+export function createViewComponent(viewType, object = null, options = {}) {
+  return {
+    viewType,
+    object,
+    path: options.path || '',
+    visible: options.visible !== undefined ? options.visible : false,
+    loaded: !!object,
+    metadata: options.metadata || {}
+  }
+}
+
+export function createMeshViewComponent(object = null, options = {}) {
+  return createViewComponent('GridView', object, {
+    ...options,
+    visible: options.visible !== undefined ? options.visible : true
+  })
+}
+
+export function createVoxelViewComponent(object = null, options = {}) {
+  return createViewComponent('VoxelView', object, options)
+}
+
+export function createCloudPointViewComponent(object = null, options = {}) {
+  return createViewComponent('CloudPointView', object, options)
+}
+
+export function createActiveViewComponent(activeView = 'GridView') {
+  return {
+    activeView,
+    setActiveView(viewType) {
+      this.activeView = viewType
+    }
+  }
+}
+
 export function createGroupComponent() {
   return {
     groupIds: [],
@@ -119,15 +158,15 @@ export function createColliderComponent(type = 'box') {
 
 export function createBasicGeometries() {
   return {
-    cube: new THREE.BoxGeometry(1, 1, 1),
-    sphere: new THREE.SphereGeometry(0.5, 32, 32),
-    cylinder: new THREE.CylinderGeometry(0.5, 0.5, 1, 32),
-    cone: new THREE.ConeGeometry(0.5, 1, 32),
-    torus: new THREE.TorusGeometry(0.5, 0.2, 16, 100),
-    tetrahedron: new THREE.TetrahedronGeometry(0.5),
-    octahedron: new THREE.OctahedronGeometry(0.5),
-    dodecahedron: new THREE.DodecahedronGeometry(0.5),
-    plane: new THREE.PlaneGeometry(1, 1)
+    cube: new THREE.BoxGeometry(10, 10, 10),
+    sphere: new THREE.SphereGeometry(5, 32, 32),
+    cylinder: new THREE.CylinderGeometry(5, 5, 10, 32),
+    cone: new THREE.ConeGeometry(5, 10, 32),
+    torus: new THREE.TorusGeometry(5, 2, 16, 100),
+    tetrahedron: new THREE.TetrahedronGeometry(5),
+    octahedron: new THREE.OctahedronGeometry(5),
+    dodecahedron: new THREE.DodecahedronGeometry(5),
+    plane: new THREE.PlaneGeometry(10, 10)
   }
 }
 
@@ -135,49 +174,49 @@ export function createPrimitiveGeometry(type, params = {}) {
   switch (type) {
     case 'cube':
       return new THREE.BoxGeometry(
-        params.width || 1,
-        params.height || 1,
-        params.depth || 1
+        params.width || 10,
+        params.height || 10,
+        params.depth || 10
       )
     case 'sphere':
       return new THREE.SphereGeometry(
-        params.radius || 0.5,
+        params.radius || 5,
         params.widthSegments || 32,
         params.heightSegments || 32
       )
     case 'cylinder':
       return new THREE.CylinderGeometry(
-        params.radiusTop || 0.5,
-        params.radiusBottom || 0.5,
-        params.height || 1,
+        params.radiusTop || 5,
+        params.radiusBottom || 5,
+        params.height || 10,
         params.radialSegments || 32
       )
     case 'cone':
       return new THREE.ConeGeometry(
-        params.radius || 0.5,
-        params.height || 1,
+        params.radius || 5,
+        params.height || 10,
         params.radialSegments || 32
       )
     case 'torus':
       return new THREE.TorusGeometry(
-        params.radius || 0.5,
-        params.tube || 0.2,
+        params.radius || 5,
+        params.tube || 2,
         params.radialSegments || 16,
         params.tubularSegments || 100
       )
     case 'tetrahedron':
-      return new THREE.TetrahedronGeometry(params.radius || 0.5)
+      return new THREE.TetrahedronGeometry(params.radius || 5)
     case 'octahedron':
-      return new THREE.OctahedronGeometry(params.radius || 0.5)
+      return new THREE.OctahedronGeometry(params.radius || 5)
     case 'dodecahedron':
-      return new THREE.DodecahedronGeometry(params.radius || 0.5)
+      return new THREE.DodecahedronGeometry(params.radius || 5)
     case 'plane':
       return new THREE.PlaneGeometry(
-        params.width || 1,
-        params.height || 1
+        params.width || 10,
+        params.height || 10
       )
     default:
-      return new THREE.BoxGeometry(1, 1, 1)
+      return new THREE.BoxGeometry(10, 10, 10)
   }
 }
 
@@ -219,7 +258,12 @@ export function createLightComponent(type = 'ambient', options = {}) {
 export function createAppearanceComponent(options = {}) {
   return {
     color: options.color || '#ffffff',
-    opacity: options.opacity || 1.0
+    opacity: options.opacity !== undefined ? options.opacity : 1.0,
+    metalness: options.metalness !== undefined ? options.metalness : 0.3,
+    roughness: options.roughness !== undefined ? options.roughness : 0.7,
+    transparent: options.transparent || false,
+    wireframe: options.wireframe || false,
+    _dirty: false
   }
 }
 

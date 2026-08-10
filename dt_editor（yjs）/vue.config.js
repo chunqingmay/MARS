@@ -13,6 +13,16 @@ module.exports = defineConfig({
         pathRewrite: {
           '^/api': ''
         }
+      },
+      '/document': {
+        target: 'http://localhost:3000',
+        ws: true,
+        changeOrigin: true
+      },
+      '/model': {
+        target: 'http://localhost:3000',
+        ws: true,
+        changeOrigin: true
       }
     }
   },

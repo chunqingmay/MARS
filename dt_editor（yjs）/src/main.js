@@ -11,24 +11,24 @@ import './assets/css/global.css'
 // 导入axios
 import axios from 'axios'
 
-// 配置请求根路径 - 根据当前访问地址动态拼接，支持手机和电脑同时访问
-axios.defaults.baseURL = `http://${window.location.hostname}:3000`
+// 配置请求根路径 - 使用相对路径，利用 devServer proxy 转发到后端
+axios.defaults.baseURL = '/api'
 // 设置请求拦截器
 // // 在request拦截器中展示进度条
-// axios.interceptors.request.use(config=>{
-//   NProgress.start()
-//   // console.log(config)
-//   // 需要授权的 API ，必须在请求头中使用 `Authorization` 字段提供 `token` 令牌
-//   config.headers.Authorization = window.sessionStorage.getItem('token')
-//   // 在最后必须return config
-//   return config
-// })
+// // axios.interceptors.request.use(config=>{
+// //   NProgress.start()
+// //   // console.log(config)
+// //   // 需要授权的 API ，必须在请求头中使用 `Authorization` 字段提供 `token` 令牌
+// //   config.headers.Authorization = window.sessionStorage.getItem('token')
+// //   // 在最后必须return config
+// //   return config
+// // })
 // // 在response中隐藏进度条
-// axios.interceptors.response.use(config=>{
-//   NProgress.done()
-//   // 在最后必须return config
-//   return config
-// })
+// // axios.interceptors.response.use(config=>{
+// //   NProgress.done()
+// //   // 在最后必须return config
+// //   return config
+// // })
 Vue.prototype.$http = axios
 
 Vue.config.productionTip = false

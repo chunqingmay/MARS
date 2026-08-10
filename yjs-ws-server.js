@@ -1,5 +1,5 @@
 const { createServer } = require('http');
-const { Server } = require('ws');
+const { Server, WebSocket } = require('ws');
 
 let clientCounter = 0;
 
@@ -33,14 +33,14 @@ wss.on('connection', (ws) => {
   ws.on('message', (message) => {
     // Broadcast to all other clients
     wss.clients.forEach((client) => {
-      if (client !== ws && client.readyState === ws.OPEN) {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
         client.send(message);
       }
     });
   });
 });
 
-const PORT = 1234;
+const PORT = 1235;
 httpServer.listen(PORT, () => {
   console.log(`Yjs WebSocket server running on port ${PORT}`);
 });

@@ -10,18 +10,15 @@ import document from '../pages/files/document'
 import shareFiles from '../pages/files/shareFiles'
 import recycleBin from '../pages/files/recycleBin'
 
-
-
-
 const originalPush = VueRouter.prototype.push
 
 VueRouter.prototype.push = function push(location) {
-  return originalPush.call(this, location).catch(err => err)
+  return originalPush.call(this, location).catch(err => {
+    if (err.name !== 'NavigationDuplicated') throw err
+  })
 }
 
 function isAuthenticated() {
-  // 这里替换成你的验证逻辑
-  // 例如，检查localStorage或Vuex状态中的认证信息
   return localStorage.getItem('token') !== null;
 }
 
@@ -53,6 +50,15 @@ const routes = [
     name: 'files',
     component: files,
     redirect:'/:userId/document',
+    beforeEnter: (to, from, next) => {
+      if (!isAuthenticated()) {
+        alert("您尚未登录，请先登录后再尝试访问。");
+        localStorage.setItem('attemptedUrl', to.fullPath);
+        next('/login');
+      } else {
+        next();
+      }
+    },
     children:[
       {
         path:'/:userId/document',
@@ -75,16 +81,13 @@ const routes = [
     component: modeling,
     beforeEnter: (to, from, next) => {
       if (!isAuthenticated()) {
-        // 如果用户未登录，则保存当前尝试访问的URL并重定向到登录页面
         alert("您尚未登录，请先登录后再尝试访问。");
         localStorage.setItem('attemptedUrl', to.fullPath);
         next('/login');
       } else {
-        // 如果用户已登录，允许访问
         next();
       }
     },
-    
   },
 ]
 

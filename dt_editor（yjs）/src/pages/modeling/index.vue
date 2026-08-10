@@ -130,6 +130,20 @@
                           {{ viewType.label }}
                         </el-button>
                       </div>
+                      <div class="view_edit_control" style="margin-top: 8px; width: 100%;">
+                        <div class="view-edit-title">
+                          协同对象编辑：{{ selectedEntityId || '请先选择实体' }}
+                        </div>
+                        <div v-for="objectType in contentEditableObjectTypes" :key="objectType.value" class="view-edit-row">
+                          <span class="view-edit-label">{{ objectType.label }}</span>
+                          <el-button size="mini" type="success" :disabled="!canEditViewContent(selectedEntityId, objectType.value) || getViewEditState(selectedEntityId, objectType.value) === 'added'" @click="addViewContent(selectedEntityId, objectType.value)">
+                            添加
+                          </el-button>
+                          <el-button size="mini" type="danger" :disabled="!canEditViewContent(selectedEntityId, objectType.value) || getViewEditState(selectedEntityId, objectType.value) !== 'added'" @click="deleteViewContent(selectedEntityId, objectType.value)">
+                            删除
+                          </el-button>
+                        </div>
+                      </div>
                     </div>
                     <el-tree
                       :data="sceneTreeData"
@@ -275,7 +289,7 @@
   import dat from 'dat.gui'
   import { WebsocketProvider } from 'y-websocket'
   import * as Y from 'yjs'
-  import { initYjsLatencyHelper, measureYjsAction, printYjsLatencyReport } from '@/utils/yjsLatencyHelper'
+  import { initYjsLatencyHelper, measureYjsAction, printYjsLatencyReport, recordYjsAction } from '@/utils/yjsLatencyHelper'
   import Ball from './Ball.vue' // Import ball component
   import {GLTFExporter} from "three/examples/jsm/exporters/GLTFExporter"
   import {OBJExporter} from "three/examples/jsm/exporters/OBJExporter"
@@ -287,7 +301,32 @@
   import {PCDLoader} from "three/examples/jsm/loaders/PCDLoader"
   import {PLYLoader} from "three/examples/jsm/loaders/PLYLoader"
   import { saveAs } from 'file-saver';
+  import {
+    OFFICE_ENTITIES,
+    OFFICE_ENTITY_IDS,
+    getOfficeEntityViewPaths,
+    getOfficeViewOffset,
+    getOfficeVoxelScale,
+    getOfficeCloudPointScale,
+    getOfficeCloudPointAxisDirection
+  } from '@/utils/modeling/officeSceneConfig'
+  import {
+    findOfficeViewObject,
+    registerOfficeViewObject,
+    applyVoxelWireframe,
+    applyBlackMaterial,
+    finishOfficeViewLoad,
+    findViewEditLayer,
+    removeViewEditLayer,
+    createCloudPointEditLayer,
+    createGridEditLayer
+  } from '@/utils/modeling/officeViewHelpers'
 
+  const OFFICE_COLLAB_OBJECT_TYPES = [
+    { label: 'GLB图层', value: 'GridView', crdtKey: 'meshView' },
+    { label: '体素', value: 'VoxelView', crdtKey: 'voxelView' },
+    { label: '离散点', value: 'CloudPointView', crdtKey: 'cloudPointView' }
+  ]
 
   export default{
     components:{myHeader,Ball
@@ -364,11 +403,14 @@
           { label: 'Voxel View', value: 'VoxelView' },
           { label: 'Point Cloud View', value: 'CloudPointView' }
         ],
+        editableObjectTypes: OFFICE_COLLAB_OBJECT_TYPES,
+        contentEditableObjectTypes: OFFICE_COLLAB_OBJECT_TYPES.filter(item => item.value !== 'VoxelView'),
         currentViewType: 'GridView', // Current view type
         // Model entity management
         modelEntities: [], // Model entity list
         currentEntityId: 0, // Current entity ID
         selectedEntityId: null, // Currently selected entity ID
+        selectedObject: null, // Currently selected Three.js object
         loadingOfficeEntities: new Set(), // Experiment model loading flag, prevent CRDT race condition duplicate loading
         elements:[
           {
@@ -810,6 +852,13 @@
         if (!parentObj) return
         
         console.log('Switch view:', viewType, 'Parent object:', parentObj.name, 'Entity ID:', parentObj.userData.entityId)
+
+        if (parentObj.userData && parentObj.userData.entityId && this.marsEntities && this.marsEntities.has(parentObj.userData.entityId)) {
+          if (viewType === 'GridView' || viewType === 'VoxelView' || viewType === 'CloudPointView') {
+            this.switchMarsView(parentObj.userData.entityId, viewType)
+            return
+          }
+        }
         
         // When clicking point cloud view, set currently selected entity ID
         if (viewType === 'pointcloud') {
@@ -909,7 +958,8 @@
             voxelView.visible = true
             console.log('Voxel view displayed:', voxelView)
           } else if (entityId && this.marsEntities && this.marsEntities.has(entityId)) {
-            const path = this.marsEntities.get(entityId).get('voxelView').toString()
+            const voxelViewValue = this.marsEntities.get(entityId).get('voxelView')
+            const path = voxelViewValue ? voxelViewValue.toString() : ''
             if (path) {
               this.loadVoxelView(entityId, path, 0)
             }
@@ -926,7 +976,8 @@
             cloudPointView.visible = true
             console.log('Point cloud view displayed:', cloudPointView)
           } else if (entityId && this.marsEntities && this.marsEntities.has(entityId)) {
-            const path = this.marsEntities.get(entityId).get('cloudPointView').toString()
+            const cloudPointViewValue = this.marsEntities.get(entityId).get('cloudPointView')
+            const path = cloudPointViewValue ? cloudPointViewValue.toString() : ''
             if (path) {
               this.loadCloudPointView(entityId, path, 0)
             }
@@ -943,7 +994,8 @@
             gridView.visible = true
             console.log('Grid view displayed:', gridView)
           } else if (entityId && this.marsEntities && this.marsEntities.has(entityId)) {
-            const path = this.marsEntities.get(entityId).get('meshView').toString()
+            const meshViewValue = this.marsEntities.get(entityId).get('meshView')
+            const path = meshViewValue ? meshViewValue.toString() : ''
             if (path) {
               this.loadGridView(entityId, path, 0)
             }
@@ -1147,29 +1199,40 @@
 
       initECSWorld() {
         import('@/utils/ecs/index.js').then(({
-          ECSWorld, MeshSystem, TransformSystem, RenderSystem,
-          CRDTSystem, InputSystem, LayerSystem, entityManager
+          MarsWorld, MeshSystem, TransformSystem, RenderSystem, ViewRepresentationSystem,
+          CRDTSystem, InputSystem, LayerSystem, ViewEditSystem, PhysicSystem, PhygitalSyncSystem, CollabSyncSystem, entityManager
         }) => {
-          this.ecsWorld = new ECSWorld()
+          this.ecsWorld = new MarsWorld()
+          this.ecsWorld.init(this.scene, this.camera, this.renderer)
+          this.ecsWorld.objectsGroup = this.objects
+          this.entityManager = entityManager
           this.ecsWorld.init(this.scene, this.camera, this.renderer)
           this.ecsWorld.objectsGroup = this.objects
           if (!this.scene.children.includes(this.objects)) {
             this.scene.add(this.objects)
           }
 
-          this.meshSystem = new MeshSystem(this.scene, this.objects)
-          this.transformSystem = new TransformSystem(this.scene)
-          this.renderSystem = new RenderSystem()
           this.crdtSystem = new CRDTSystem(this.doc1)
           this.crdtSystem.setScene(this.scene)
+          this.ecsWorld.setCRDTSystem(this.crdtSystem)
           this.crdtSystem.onEntityCreated = (entityId, yjsEntity) => {
             this.updateSceneTree()
           }
           this.crdtSystem.onEntityRemoved = (entityId) => {
             this.updateSceneTree()
           }
-          const inputSystem = new InputSystem(this.camera, this.renderer, this.orbitControls, this.transformControls)
+
+          this.meshSystem = new MeshSystem(this.scene, this.objects)
+          this.transformSystem = new TransformSystem(this.scene, this.crdtSystem)
+          this.transformSystem.setTransformControls(this.transformControls)
+          this.renderSystem = new RenderSystem()
+          this.viewRepresentationSystem = new ViewRepresentationSystem()
+          const inputSystem = new InputSystem(this.camera, this.renderer, this.orbitControls, this.transformControls, this.scene)
           this.layerSystem = new LayerSystem(this.objects)
+          this.physicSystem = new PhysicSystem()
+          this.phygitalSyncSystem = new PhygitalSyncSystem()
+          this.collabSyncSystem = new CollabSyncSystem(this.doc1, this.crdtSystem)
+          this.viewEditSystem = new ViewEditSystem(this.scene, this.crdtSystem)
 
           this.meshSystem.onEntityCreated = (entityId, mesh) => {
             if (this.gui && mesh) {
@@ -1180,10 +1243,19 @@
 
           this.ecsWorld.addSystem(this.meshSystem)
           this.ecsWorld.addSystem(this.transformSystem)
+          this.ecsWorld.addSystem(this.physicSystem)
+          this.ecsWorld.addSystem(this.phygitalSyncSystem)
           this.ecsWorld.addSystem(this.renderSystem)
+          this.ecsWorld.addSystem(this.viewRepresentationSystem)
           this.ecsWorld.addSystem(this.crdtSystem)
           this.ecsWorld.addSystem(inputSystem)
           this.ecsWorld.addSystem(this.layerSystem)
+          this.ecsWorld.addSystem(this.viewEditSystem)
+          this.ecsWorld.addSystem(this.collabSyncSystem)
+
+          this.ecsWorld.onBeforeRender = () => {
+            this.syncTransformControlsVisibility()
+          }
 
           this.ecsWorld.onAfterRender = () => {
             if (this.gui && typeof this.gui.update === 'function') {
@@ -1221,10 +1293,10 @@
 
       // 初始化场景树
       initSceneTree() {
-        // 初始化树数据，根节点为背景
+        // Initialize tree data, root node is background
         this.sceneTreeData = [{
           id: '0',
-          name: '背景',
+          name: 'Background',
           children: [],
           isRoot: true
         }]
@@ -1241,7 +1313,7 @@
       updateSceneTree() {
         const newRootNode = {
           id: '0',
-          name: '背景',
+          name: 'Background',
           isRoot: true,
           children: []
         }
@@ -1337,26 +1409,21 @@
         
         // 为模型对象添加视图子节点
         if (obj.userData && obj.userData.entityId) {
-          treeNode.children.push({
-            id: this.treeIdCounter++,
-            name: 'Mesh View',
-            viewType: 'GridView',
-            parentUuid: obj.uuid,
-            children: []
-          })
-          treeNode.children.push({
-            id: this.treeIdCounter++,
-            name: 'Voxel View',
-            viewType: 'VoxelView',
-            parentUuid: obj.uuid,
-            children: []
-          })
-          treeNode.children.push({
-            id: this.treeIdCounter++,
-            name: 'Point Cloud View',
-            viewType: 'CloudPointView',
-            parentUuid: obj.uuid,
-            children: []
+          const viewNames = {
+            GridView: 'Mesh View',
+            VoxelView: 'Voxel View',
+            CloudPointView: 'Point Cloud View'
+          }
+          Object.keys(viewNames).forEach(viewType => {
+            if (views[viewType]) {
+              treeNode.children.push({
+                id: this.treeIdCounter++,
+                name: viewNames[viewType],
+                viewType,
+                parentUuid: obj.uuid,
+                children: []
+              })
+            }
           })
         } else if (obj instanceof THREE.Mesh) {
           // 原始视图
@@ -1427,16 +1494,148 @@
         const obj = data.object
         if (obj) {
           // 选择对象，与变换控制器结合
-          this.transformControls.attach(obj)
-          this.scene.add(this.transformControls)
+          this.activateTransformControls(obj)
           
-          // 如果是模型，显示其控制面板
-          if (obj instanceof THREE.Mesh) {
-            console.log('选择了模型:', obj.name)
-          }
+          // 记录选中的对象和 entityId
+          this.selectedObject = obj
+          this.selectedEntityId = obj.userData.entityId || null
+          console.log('选择了对象:', obj.name, 'entityId:', obj.userData.entityId)
         }
       },
-      
+
+      // 对外部 Three.js 对象直接应用外观修改（递归遍历子对象）
+      _applyAppearanceToObject(obj, appearance) {
+        function applyMat(node) {
+          // Collaborative edit layers keep their semantic highlight colors.
+          if (node.userData && node.userData.isViewEditLayer) return
+          // Mesh 对象 (GridView, VoxelView)
+          if (node.isMesh && node.material) {
+            const materials = Array.isArray(node.material) ? node.material : [node.material]
+            materials.forEach(mat => {
+              // 禁用顶点颜色
+              if (mat.vertexColors) mat.vertexColors = false
+              if (appearance.color && mat.color) {
+                // 移除纹理贴图 — 否则纹理颜色会覆盖用户选择的纯色
+                if (mat.map) mat.map = null
+                mat.color.set(appearance.color)
+              }
+              if (mat.transparent !== undefined) mat.transparent = appearance.transparent
+              if (mat.opacity !== undefined) mat.opacity = appearance.opacity
+              mat.needsUpdate = true
+              if (mat.metalness !== undefined) mat.metalness = appearance.metalness
+              if (mat.roughness !== undefined) mat.roughness = appearance.roughness
+              if (mat.wireframe !== undefined) mat.wireframe = appearance.wireframe
+            })
+          }
+          // Points 对象 (CloudPointView)
+          if (node.isPoints && node.material) {
+            if (appearance.color && node.material.color) {
+              if (node.material.map) node.material.map = null
+              node.material.color.set(appearance.color)
+            }
+            node.material.transparent = appearance.transparent
+            node.material.opacity = appearance.opacity
+            node.material.needsUpdate = true
+          }
+          if (node.children) node.children.forEach(applyMat)
+        }
+        applyMat(obj)
+      },
+
+      getExperimentAppearance(entityId, appearance = {}) {
+        if (OFFICE_ENTITY_IDS.includes(entityId)) {
+          return {
+            ...appearance,
+            color: '#000000'
+          }
+        }
+        return appearance
+      },
+
+      getExperimentEntityIdFromObject(object) {
+        let current = object
+        while (current) {
+          const entityId = current.userData && current.userData.entityId
+          if (entityId && OFFICE_ENTITY_IDS.includes(entityId)) {
+            return entityId
+          }
+          current = current.parent
+        }
+        return ''
+      },
+
+      setObjectMaterialColor(object, color) {
+        if (!object) return
+        if (object.material) {
+          const materials = Array.isArray(object.material) ? object.material : [object.material]
+          materials.forEach((material) => {
+            if (material.color) {
+              material.color.set(color)
+              material.needsUpdate = true
+            }
+          })
+        }
+      },
+
+      restoreObjectSelectionColor(object) {
+        if (this.getExperimentEntityIdFromObject(object)) {
+          this.setObjectMaterialColor(object, 0x000000)
+        } else {
+          this.setObjectMaterialColor(object, 0x7777ff)
+        }
+      },
+
+      getRootSceneObject(object) {
+        let current = object
+        while (current && current.parent && current.parent !== this.objects) {
+          current = current.parent
+        }
+        return current && current.parent === this.objects ? current : null
+      },
+
+      clearTransformControlsForObject(object) {
+        if (!this.transformControls || !object) return
+        const attached = this.transformControls.object
+        if (!attached) return
+
+        let current = attached
+        while (current) {
+          if (current === object) {
+            this.resetTransformControls()
+            return
+          }
+          current = current.parent
+        }
+      },
+
+      resetTransformControls() {
+        if (!this.transformControls) return
+        this.transformControls.detach()
+        this.transformControls.enabled = false
+        this.transformControls.visible = false
+        if (this.transformControls.parent) {
+          this.transformControls.parent.remove(this.transformControls)
+        }
+      },
+
+      activateTransformControls(object) {
+        if (!this.transformControls || !object) return
+        if (!this.transformControls.parent) {
+          this.scene.add(this.transformControls)
+        }
+        this.transformControls.visible = true
+        this.transformControls.enabled = true
+        this.transformControls.attach(object)
+      },
+
+      syncTransformControlsVisibility() {
+        if (!this.transformControls) return
+        if (!this.transformControls.object) {
+          this.transformControls.visible = false
+          this.transformControls.enabled = false
+        }
+      },
+
       // 删除包含特定UUID模型的所有组
       deleteGroupsContainingModel(uuid) {
         try {
@@ -1517,14 +1716,22 @@
       
       // 获取文档信息
       async getDocument(){
-        const documentId = this.$route.params.documentId
-        const{data:res} = await this.$http.get('/document/getDocumentById', {
-          params:{
-            documentId:documentId
+        try {
+          const documentId = this.$route.params.documentId
+          const{data:res} = await this.$http.get('/document/getDocumentById', {
+            params:{
+              documentId:documentId
+            }
+          })
+          if (res && res.data) {
+            this.documentInfo = res.data
+            console.log(this.documentInfo.documentName)
+          } else {
+            console.error('获取文档信息失败: 响应数据为空', res)
           }
-        })
-        this.documentInfo = res.data
-        console.log(this.documentInfo.documentName)
+        } catch (error) {
+          console.error('获取文档信息时发生错误:', error)
+        }
       },
 
       //yjs初始化
@@ -1569,6 +1776,7 @@
         // MARS ECS-CRDT 顶层结构
         this.marsEntities = this.doc1.getMap('entities')  // 实体桶
         this.marsGroups = this.doc1.getMap('groups')       // 组信息桶
+        this.marsExperiments = this.doc1.getMap('experiments') // 实验数据桶
 
         // 旧结构（保留兼容性）
         this.delete_map = this.doc1.getMap('Deletemodel')
@@ -1592,25 +1800,18 @@
       // 获取下一个全局CRDT序列号（跨设备共享）
       getNextGlobalSequenceId() {
         if (!this.globalEventCounter) return 0
-        
+        // 直接递增，避免在 observer 回调中使用嵌套 transact
         let currentCounter = this.globalEventCounter.get('counter') || 0
         let nextCounter = currentCounter + 1
-        
-        // 使用 transact 确保原子性
-        this.doc1.transact(() => {
-          this.globalEventCounter.set('counter', nextCounter)
-          this.globalEventCounter.set('lastUpdateTime', Date.now())
-        })
-        
-        console.log(`生成全局序列号: ${nextCounter}`)
+        this.globalEventCounter.set('counter', nextCounter)
+        this.globalEventCounter.set('lastUpdateTime', Date.now())
         return nextCounter
       },
 
       // 初始化 MARS 实体（微型办公工位场景：5个实体）
       initMarsEntities() {
-        const entityIds = ['desk_1', 'chair_1', 'monitor_1', 'lamp_1', 'cabinet_1']
-        entityIds.forEach(id => this.createMarsEntity(id))
-        console.log('MARS 实体初始化完成:', entityIds)
+        OFFICE_ENTITY_IDS.forEach(id => this.createMarsEntity(id))
+        console.log('MARS 实体初始化完成:', OFFICE_ENTITY_IDS)
       },
 
       // 创建单个 MARS 实体
@@ -1634,6 +1835,11 @@
         const cloudPointView = new Y.Text()
         entityMap.set('cloudPointView', cloudPointView)
 
+        // 已加载视图内部的协同编辑状态（实验 4.2(4)）
+        ;['meshViewEdit', 'voxelViewEdit', 'cloudPointViewEdit'].forEach(key => {
+          entityMap.set(key, new Y.Text())
+        })
+
         // Transform: LWW-Register (Y.Text) - 变换矩阵
         const transform = new Y.Text()
         transform.insert(0, JSON.stringify({
@@ -1646,8 +1852,12 @@
         // Appearance: LWW-Register (Y.Text) - 外观
         const appearance = new Y.Text()
         appearance.insert(0, JSON.stringify({
-          color: '#ffffff',
-          opacity: 1.0
+          color: '#000000',
+          opacity: 1.0,
+          metalness: 0.3,
+          roughness: 0.7,
+          transparent: false,
+          wireframe: false
         }))
         entityMap.set('appearance', appearance)
 
@@ -1685,20 +1895,22 @@
       setupMarsObservers() {
         // 深观察所有实体变化
         this.marsEntities.observeDeep((eventsOrEvent, transaction) => {
-          // 获取全局CRDT序列号（所有设备共享）
-          const currentSequenceId = this.getNextGlobalSequenceId()
-          const sequenceTimestamp = Date.now()
-          const isLocal = transaction && transaction.local === true
-          // 兼容不同 Yjs 版本：observeDeep 可能传数组或单个事件
+          // 跳过本地事务，避免本地操作触发反向同步造成竞争
+          if (transaction && transaction.local) return
+
+          // 注意：不在此处调用 getNextGlobalSequenceId，因为其内部的 Yjs 操作
+          // 会与 observer 回调中的事件处理冲突
+
           const events = Array.isArray(eventsOrEvent) ? eventsOrEvent : [eventsOrEvent]
-          
+
           events.forEach(event => {
-            // 确定是哪个实体的哪个字段发生了变化
             if (event && event.path && event.path.length >= 1) {
               const entityId = event.path[0]
-              // entityId 可能是字符串（实验模型）或数字（基础模型）
+              console.log('[setupMarsObservers] 远程变更 path:', event.path, 'local:', transaction ? transaction.local : 'null')
               if (this.marsEntities.has(entityId)) {
-                this.syncFromCRDT(entityId, currentSequenceId, sequenceTimestamp, isLocal)
+                this.syncFromCRDT(entityId, 0, 0, transaction ? transaction.local : false)
+              } else {
+                console.log('[setupMarsObservers] 实体不在 marsEntities 中:', entityId)
               }
             }
           })
@@ -1712,6 +1924,16 @@
         // 监听组变化
         this.marsGroups.observe((event) => {
           this.syncGroupsFromYjs()
+        })
+
+        // 监听实验数据变化 (ping/pong 延迟测量)
+        this.marsExperiments.observe((event) => {
+          if (event.keysChanged && event.keysChanged.has('ping')) {
+            this._handleExperimentPing()
+          }
+          if (event.keysChanged && event.keysChanged.has('pong')) {
+            this._handleExperimentPong()
+          }
         })
 
         console.log('MARS CRDT 观察者已设置')
@@ -1729,91 +1951,149 @@
         }
 
         // 检查逻辑删除
-        const deleted = entityMap.get('deleted').toString()
+        const deletedValue = entityMap.get('deleted')
+        const deleted = deletedValue ? deletedValue.toString() : 'false'
         if (deleted === 'true') {
           this.removeObjectByEntityId(entityId)
           return
         }
 
-        // 同步 Transform
-        const transformText = entityMap.get('transform').toString()
-        if (!transformText) {
-          console.log(`实体 ${entityId} transform 为空，跳过同步`)
-          return
-        }
-        try {
-          const transform = JSON.parse(transformText)
-          // 找到所有具有相同entityId的对象
-          const entityObjects = this.objects.children.filter(obj => {
-            return obj.userData && obj.userData.entityId === entityId
-          })
+        // === 同步 Transform ===
+        const transformValue = entityMap.get('transform')
+        const transformText = transformValue ? transformValue.toString() : ''
+        let transformParsed = false
+        if (transformText) {
+          try {
+            const transform = JSON.parse(transformText)
+            transformParsed = true
+            // 找到所有具有相同entityId的对象
+            const entityObjects = this.objects.children.filter(obj => {
+              return obj.userData && obj.userData.entityId === entityId
+            })
 
-          // 如果对象不存在，但CRDT有视图路径，说明是远程创建的，需要自动加载
-          if (entityObjects.length === 0) {
-            const meshViewPath = entityMap.get('meshView').toString()
-            if (meshViewPath) {
-              console.log('检测到远程实体', entityId, '开始自动加载...')
-              this.loadGridViewFromCRDT(entityId, entityMap.get('meshView').toString(), transform)
-              this.loadVoxelViewFromCRDT(entityId, entityMap.get('voxelView').toString(), transform)
-              this.loadCloudPointViewFromCRDT(entityId, entityMap.get('cloudPointView').toString(), transform)
-              return
+            // 如果对象不存在，但CRDT有视图路径，说明是远程创建的，需要自动加载
+            if (entityObjects.length === 0) {
+              const hasAnyViewPath = OFFICE_COLLAB_OBJECT_TYPES.some(viewDef => {
+                const viewValue = entityMap.get(viewDef.crdtKey)
+                return viewValue && viewValue.toString()
+              })
+              if (hasAnyViewPath) {
+                console.log('检测到远程实体', entityId, '开始自动加载...')
+                this.syncMarsObjectsFromCRDT(entityId, entityMap, transform)
+                return
+              }
+
+              // 如果是基本形状（cube/sphere/cylinder），从CRDT创建
+              const typeText = entityMap.get('type')
+              if (typeText) {
+                const type = typeText.toString()
+                if (type) {
+                  console.log('检测到远程基本形状', entityId, '类型:', type)
+                  this.createBasicShapeFromCRDT(entityId, type, transform)
+                  return
+                }
+              }
             }
 
-            // 如果是基本形状（cube/sphere/cylinder），从CRDT创建
-            const typeText = entityMap.get('type')
-            if (typeText) {
-              const type = typeText.toString()
-              if (type) {
-                console.log('检测到远程基本形状', entityId, '类型:', type)
-                this.createBasicShapeFromCRDT(entityId, type, transform)
+            // 如果正在拖拽该实体，跳过 transform 应用，避免覆盖用户操作
+            if (this.isDraggingModel && this.transformControls && this.transformControls.object) {
+              const draggingEntityId = this.transformControls.object.userData.entityId
+              if (draggingEntityId === entityId) {
                 return
               }
             }
-          }
 
-          if (this.ecsInitialized && this.ecsWorld) {
-            const render = this.ecsWorld.entityManager.getComponent(entityId, 'render')
-            if (render && render.mesh) return
-          }
+            entityObjects.forEach(obj => {
+              obj.position.set(transform.x, transform.y, transform.z)
+              obj.rotation.set(transform.rx, transform.ry, transform.rz)
+            })
 
-          entityObjects.forEach(obj => {
-            obj.position.set(transform.x, transform.y, transform.z)
-            obj.rotation.set(transform.rx, transform.ry, transform.rz)
-          })
-
-          // 远程同步时通过防抖输出日志（避免移动端拖拽时每帧都输出）
-          if (entityObjects.length > 0 && sequenceId > 0 && !this.isDraggingModel && !isLocal) {
-            // 保存最新的远程同步数据
-            this.pendingRemoteLogs[entityId] = {
-              entityId,
-              transform,
-              sequenceId,
-              crdtEventCount
+            // 同步 ECS transform 组件，避免 TransformSystem 反向同步竞争
+            if (this.entityManager) {
+              const ecsTransform = this.entityManager.getComponent(entityId, 'transform')
+              if (ecsTransform) {
+                ecsTransform.position.set(transform.x, transform.y, transform.z)
+                ecsTransform.rotation.set(transform.rx, transform.ry, transform.rz)
+                if (transform.sx !== undefined && transform.sy !== undefined && transform.sz !== undefined) {
+                  ecsTransform.scale.set(transform.sx, transform.sy, transform.sz)
+                }
+                ecsTransform.updateQuaternion()
+              }
             }
-            // 清除旧的防抖计时器
-            if (this.remoteLogTimers[entityId]) {
-              clearTimeout(this.remoteLogTimers[entityId])
+
+            // 远程同步时通过防抖输出日志
+            if (entityObjects.length > 0 && sequenceId > 0 && !this.isDraggingModel && !isLocal) {
+              this.pendingRemoteLogs[entityId] = {
+                entityId,
+                transform,
+                sequenceId,
+                crdtEventCount
+              }
+              if (this.remoteLogTimers[entityId]) {
+                clearTimeout(this.remoteLogTimers[entityId])
+              }
+              this.remoteLogTimers[entityId] = setTimeout(() => {
+                this.flushRemoteLog(entityId)
+              }, 500)
             }
-            // 500ms 内没有新同步则认为操作结束，输出一次日志
-            this.remoteLogTimers[entityId] = setTimeout(() => {
-              this.flushRemoteLog(entityId)
-            }, 500)
+          } catch (e) {
+            console.warn('Transform 解析失败:', e)
           }
-        } catch (e) {
-          console.warn('Transform 解析失败:', e)
         }
 
-        if (this.ecsInitialized && this.ecsWorld) {
-          const render = this.ecsWorld.entityManager.getComponent(entityId, 'render')
-          if (render && render.mesh) return
+        // === 同步各视图表示的添加/删除 ===
+        this.syncMarsObjectsFromCRDT(entityId, entityMap, transformParsed ? this.getMarsTransform(entityId) : null)
+
+        // === 同步 Apperance (外观) ===
+        // 外观同步独立于 transform，即使 transform 为空也能正常同步
+        const appearanceValue = entityMap.get('appearance')
+        const appearanceText = appearanceValue ? appearanceValue.toString() : ''
+        if (appearanceText) {
+          try {
+            const appearance = this.getExperimentAppearance(entityId, JSON.parse(appearanceText))
+            // 对该 entityId 下所有视图对象应用外观（office模型有GridView/VoxelView/CloudPointView共用entityId）
+            let appliedCount = 0
+            this.objects.children.forEach(obj => {
+              if (obj.userData && obj.userData.entityId === entityId) {
+                this._applyAppearanceToObject(obj, {
+                  color: appearance.color,
+                  opacity: appearance.opacity !== undefined ? appearance.opacity : 1.0,
+                  metalness: appearance.metalness !== undefined ? appearance.metalness : 0.3,
+                  roughness: appearance.roughness !== undefined ? appearance.roughness : 0.7,
+                  transparent: appearance.transparent || false,
+                  wireframe: appearance.wireframe || false
+                })
+                appliedCount++
+              }
+            })
+            console.log('[syncFromCRDT] 应用外观到', entityId, '共', appliedCount, '个对象 color:', appearance.color)
+          } catch (e) {
+            console.warn('Appearance 解析失败:', e)
+          }
         }
 
-        // 同步 Layer
-        const layer = parseInt(entityMap.get('layer').toString()) || 1
-        const threeObj = this.findObjectByEntityId(entityId)
-        if (threeObj) {
-          threeObj.userData.layer = layer
-          threeObj.renderOrder = layer * 1000
+        // === 同步 Layer ===
+        const layerValue = entityMap.get('layer')
+        const layer = parseInt(layerValue ? layerValue.toString() : '1') || 1
+        this.objects.children.forEach(obj => {
+          if (obj.userData && obj.userData.entityId === entityId) {
+            obj.userData.layer = layer
+            obj.renderOrder = layer * 1000
+          }
+        })
+
+        // === 同步 ActiveView（仅由视图切换按钮使用；对象编辑不依赖该字段） ===
+        if (!isLocal && this.syncActiveViewVisibility) {
+          const activeViewValue = entityMap.get('activeView')
+          const activeView = activeViewValue ? activeViewValue.toString() : ''
+          if (activeView && (activeView === 'GridView' || activeView === 'VoxelView' || activeView === 'CloudPointView')) {
+            this.objects.children.forEach(obj => {
+              if (obj.userData && obj.userData.entityId === entityId) {
+                obj.visible = (obj.userData.viewType === activeView)
+              }
+            })
+            console.log('[syncFromCRDT] 同步 ActiveView:', entityId, '→', activeView)
+          }
         }
       },
 
@@ -1927,6 +2207,26 @@
           mesh.material.depthWrite = true
         }
 
+        // 应用 CRDT 中的外观设置（协同同步）
+        const crdtEntity = this.marsEntities.get(entityId)
+        if (crdtEntity) {
+          const appearanceValue = crdtEntity.get('appearance')
+          const appearanceText = appearanceValue ? appearanceValue.toString() : ''
+          if (appearanceText) {
+            try {
+              const appearance = this.getExperimentAppearance(entityId, JSON.parse(appearanceText))
+              this._applyAppearanceToObject(mesh, {
+                color: appearance.color,
+                opacity: appearance.opacity !== undefined ? appearance.opacity : 1.0,
+                metalness: appearance.metalness !== undefined ? appearance.metalness : 0.3,
+                roughness: appearance.roughness !== undefined ? appearance.roughness : 0.7,
+                transparent: appearance.transparent || false,
+                wireframe: appearance.wireframe || false
+              })
+            } catch (e) {}
+          }
+        }
+
         this.objects.add(mesh)
         this.addModelController(mesh)
         this.sortObjectsByLayer()
@@ -1955,6 +2255,8 @@
         
         // 删除所有找到的对象
         objectsToRemove.forEach(obj => {
+          this.deleteGroupsContainingModel(obj.uuid)
+          this.clearTransformControlsForObject(obj)
           this.objects.remove(obj)
           // 同时删除对应的控制器
           if (obj.name) {
@@ -1963,8 +2265,255 @@
         })
         
         if (objectsToRemove.length > 0) {
+          this.resetTransformControls()
           this.updateSceneTree()
         }
+      },
+
+      getMarsObjectDefinition(objectType) {
+        return OFFICE_COLLAB_OBJECT_TYPES.find(item => item.value === objectType) || null
+      },
+
+      getOfficeEntityConfig(entityId) {
+        return OFFICE_ENTITIES.find(entity => entity.id === entityId) || null
+      },
+
+      getOfficeDefaultObjectPath(entityId, objectType) {
+        const config = this.getOfficeEntityConfig(entityId)
+        if (!config) return ''
+
+        const paths = getOfficeEntityViewPaths(config)
+        if (objectType === 'GridView') return paths.gridPath
+        if (objectType === 'VoxelView') return paths.voxelPath
+        if (objectType === 'CloudPointView') return paths.cloudPath
+        return ''
+      },
+
+      getMarsTransform(entityId) {
+        const entityMap = this.marsEntities ? this.marsEntities.get(entityId) : null
+        const transformValue = entityMap ? entityMap.get('transform') : null
+        const transformText = transformValue ? transformValue.toString() : ''
+
+        if (transformText) {
+          try {
+            return JSON.parse(transformText)
+          } catch (e) {
+            console.warn('Transform 解析失败:', e)
+          }
+        }
+
+        const currentObj = this.findObjectByEntityId(entityId)
+        if (currentObj) {
+          return {
+            x: currentObj.position.x, y: currentObj.position.y, z: currentObj.position.z,
+            rx: currentObj.rotation.x, ry: currentObj.rotation.y, rz: currentObj.rotation.z,
+            sx: currentObj.scale.x, sy: currentObj.scale.y, sz: currentObj.scale.z
+          }
+        }
+
+        const config = this.getOfficeEntityConfig(entityId)
+        return {
+          x: config ? config.x : 0, y: 0, z: 0,
+          rx: 0, ry: 0, rz: 0,
+          sx: 1, sy: 1, sz: 1
+        }
+      },
+
+      hasMarsObject(entityId, objectType) {
+        const entityMap = this.marsEntities ? this.marsEntities.get(entityId) : null
+        const objectDef = this.getMarsObjectDefinition(objectType)
+        if (!entityMap || !objectDef) return false
+
+        const viewValue = entityMap.get(objectDef.crdtKey)
+        if (viewValue && viewValue.toString()) return true
+
+        return !!findOfficeViewObject(this.objects, entityId, objectType)
+      },
+
+      getViewEditKey(objectType) {
+        if (objectType === 'GridView') return 'meshViewEdit'
+        if (objectType === 'VoxelView') return 'voxelViewEdit'
+        if (objectType === 'CloudPointView') return 'cloudPointViewEdit'
+        return ''
+      },
+
+      getViewEditState(entityId, objectType) {
+        if (!entityId || !this.marsEntities) return ''
+        const entityMap = this.marsEntities.get(entityId)
+        const key = this.getViewEditKey(objectType)
+        const value = entityMap && key ? entityMap.get(key) : null
+        return value ? value.toString() : ''
+      },
+
+      canEditViewContent(entityId, objectType) {
+        return !!entityId && objectType !== 'VoxelView' && this.hasMarsObject(entityId, objectType)
+      },
+
+      addViewContent(entityId, objectType, options = {}) {
+        const viewObject = findOfficeViewObject(this.objects, entityId, objectType)
+        const entityMap = this.marsEntities ? this.marsEntities.get(entityId) : null
+        const editKey = this.getViewEditKey(objectType)
+        if (!viewObject || !entityMap || !editKey || objectType === 'VoxelView') {
+          if (!options.fromSync) this.$message.warning('请先加载可编辑的 GLB 或离散点视图')
+          return false
+        }
+
+        if (!findViewEditLayer(viewObject)) {
+          const layer = objectType === 'GridView'
+            ? createGridEditLayer(viewObject, THREE)
+            : createCloudPointEditLayer(viewObject, THREE)
+          if (!layer) return false
+          viewObject.add(layer)
+        }
+
+        if (!options.fromSync) {
+          this.setYTextValueSafe(entityMap, editKey, 'added')
+          if (!options.suppressLog) this.logOperation('view_edit', `Add ${objectType} content: ${entityId}`)
+        }
+        this.updateSceneTree()
+        return true
+      },
+
+      deleteViewContent(entityId, objectType, options = {}) {
+        const viewObject = findOfficeViewObject(this.objects, entityId, objectType)
+        const entityMap = this.marsEntities ? this.marsEntities.get(entityId) : null
+        const editKey = this.getViewEditKey(objectType)
+        if (!viewObject || !entityMap || !editKey) return false
+
+        removeViewEditLayer(viewObject)
+        if (!options.fromSync) {
+          this.setYTextValueSafe(entityMap, editKey, 'deleted')
+          if (!options.suppressLog) this.logOperation('view_edit', `Delete ${objectType} content: ${entityId}`)
+        }
+        this.updateSceneTree()
+        return true
+      },
+
+      undoAddMarsObject(entityId, objectType) {
+        if (this.deleteViewContent(entityId, objectType, { suppressLog: true })) {
+          this.logOperation('view_edit', `Undo add ${objectType} content: ${entityId}`)
+        }
+      },
+
+      undoDeleteMarsObject(entityId, objectType) {
+        if (this.addViewContent(entityId, objectType, { suppressLog: true })) {
+          this.logOperation('view_edit', `Undo delete ${objectType} content: ${entityId}`)
+        }
+      },
+
+      syncViewEditFromCRDT(entityId, entityMap, objectType) {
+        const key = this.getViewEditKey(objectType)
+        if (!entityMap || !key || objectType === 'VoxelView') return
+        const value = entityMap.get(key)
+        const state = value ? value.toString() : ''
+        const viewObject = findOfficeViewObject(this.objects, entityId, objectType)
+        if (!viewObject) return
+
+        if (state === 'added') {
+          this.addViewContent(entityId, objectType, { fromSync: true })
+        } else {
+          // Both "deleted" and the initial empty state mean no extra content.
+          this.deleteViewContent(entityId, objectType, { fromSync: true })
+        }
+      },
+
+      addMarsObject(entityId, objectType) {
+        if (!entityId) return
+        const entityMap = this.createMarsEntity(entityId)
+        const objectDef = this.getMarsObjectDefinition(objectType)
+        if (!entityMap || !objectDef) return
+
+        const path = this.getOfficeDefaultObjectPath(entityId, objectType)
+        if (!path) {
+          this.$message.warning('未找到该对象的默认资源路径')
+          return
+        }
+
+        const transform = this.getMarsTransform(entityId)
+        this.setYTextValueSafe(entityMap, objectDef.crdtKey, path)
+        this.setYTextValueSafe(entityMap, 'deleted', 'false')
+
+        this.loadMarsObject(entityId, objectType, path, transform)
+        this.logOperation('object_edit', `Add ${objectDef.label}: ${entityId}`)
+      },
+
+      deleteMarsObject(entityId, objectType) {
+        if (!entityId) return
+        const entityMap = this.marsEntities ? this.marsEntities.get(entityId) : null
+        const objectDef = this.getMarsObjectDefinition(objectType)
+        if (!entityMap || !objectDef) return
+
+        this.removeMarsObject(entityId, objectType)
+
+        this.setYTextValueSafe(entityMap, objectDef.crdtKey, '')
+        this.logOperation('object_edit', `Delete ${objectDef.label}: ${entityId}`)
+      },
+
+      loadMarsObject(entityId, objectType, path, transform = null) {
+        if (!path || findOfficeViewObject(this.objects, entityId, objectType)) return
+
+        const nextTransform = transform || this.getMarsTransform(entityId)
+        if (objectType === 'GridView') {
+          this.loadGridViewFromCRDT(entityId, path, nextTransform)
+        } else if (objectType === 'VoxelView') {
+          this.loadVoxelViewFromCRDT(entityId, path, nextTransform)
+        } else if (objectType === 'CloudPointView') {
+          this.loadCloudPointViewFromCRDT(entityId, path, nextTransform)
+        }
+      },
+
+      removeMarsObject(entityId, objectType) {
+        const objectsToRemove = this.objects.children.filter(obj => {
+          return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === objectType
+        })
+
+        objectsToRemove.forEach(obj => {
+          this.clearTransformControlsForObject(obj)
+          if (this.selectedObject === obj) {
+            this.selectedObject = null
+          }
+          this.objects.remove(obj)
+          if (obj.name) {
+            this.removeModelController(obj.name)
+          }
+        })
+
+        if (objectsToRemove.length > 0) {
+          this.resetTransformControls()
+          this.updateSceneTree()
+        }
+      },
+
+      syncMarsObjectsFromCRDT(entityId, entityMap, transform = null) {
+        OFFICE_COLLAB_OBJECT_TYPES.forEach(objectDef => {
+          const objectValue = entityMap.get(objectDef.crdtKey)
+          const path = objectValue ? objectValue.toString() : ''
+          const exists = !!findOfficeViewObject(this.objects, entityId, objectDef.value)
+
+          if (!path && exists) {
+            this.removeMarsObject(entityId, objectDef.value)
+          } else if (path && !exists) {
+            this.loadMarsObject(entityId, objectDef.value, path, transform)
+          } else if (path && exists) {
+            this.syncViewEditFromCRDT(entityId, entityMap, objectDef.value)
+          }
+        })
+      },
+
+      // 安全设置 Yjs 实体的 Y.Text 值（自动创建 Y.Text 如果不存在）
+      setYTextValueSafe(yjsEntity, key, strValue) {
+        if (!yjsEntity || !this.doc1) return
+        this.doc1.transact(() => {
+          let text = yjsEntity.get(key)
+          if (!(text instanceof Y.Text)) {
+            text = new Y.Text()
+            yjsEntity.set(key, text)
+            console.log('[setYTextValueSafe] Created new Y.Text for key:', key)
+          }
+          text.delete(0, text.length)
+          text.insert(0, strValue)
+          console.log('[setYTextValueSafe] Written:', key, '=', strValue.substring(0, 80))
+        })
       },
 
       // 更新实体的 Transform（写入 CRDT）
@@ -1974,7 +2523,7 @@
 
         // 获取CRDT序列号（用于关联日志）
         const globalSeqId = this.globalEventCounter ? this.globalEventCounter.get('counter') || 0 : 0
-        
+
         // 使用 transact 确保原子性
         this.doc1.transact(() => {
           const transformText = entityMap.get('transform')
@@ -1987,6 +2536,7 @@
       switchMarsView(entityId, viewType) {
         const entityMap = this.marsEntities.get(entityId)
         if (!entityMap) return
+        this.currentViewType = viewType
 
         // LWW: 更新 ActiveView
         const activeViewText = entityMap.get('activeView')
@@ -1994,6 +2544,9 @@
           activeViewText.delete(0, activeViewText.length)
           activeViewText.insert(0, viewType)
         })
+        if (this.ecsWorld && typeof this.ecsWorld.setActiveView === 'function') {
+          this.ecsWorld.setActiveView(entityId, viewType)
+        }
 
         // 切换 Three.js 渲染器中的可见性
         // 新的视图类型映射
@@ -2003,10 +2556,41 @@
             // VoxelView 显示 VoxelView 类型
             // CloudPointView 显示 CloudPointView 类型
             obj.visible = (obj.userData.viewType === viewType)
+            if (obj.visible) {
+              this.selectedObject = obj
+              this.selectedEntityId = entityId
+            }
           }
         })
 
         console.log(`切换 ${entityId} 视图到 ${viewType}`)
+      },
+
+      // 统一所有实体到同一视图类型
+      resetAllViews(viewType = 'GridView') {
+        // 先写入 CRDT（一次性 transact 确保原子性）
+        this.doc1.transact(() => {
+          OFFICE_ENTITY_IDS.forEach(entityId => {
+            const entityMap = this.marsEntities.get(entityId)
+            if (!entityMap) return
+            const activeViewText = entityMap.get('activeView')
+            activeViewText.delete(0, activeViewText.length)
+            activeViewText.insert(0, viewType)
+          })
+        })
+        if (this.ecsWorld && typeof this.ecsWorld.setActiveView === 'function') {
+          OFFICE_ENTITY_IDS.forEach(entityId => this.ecsWorld.setActiveView(entityId, viewType))
+        }
+        // 再应用本地可见性（observer 里 isLocal=true 会跳过，所以手动设置）
+        OFFICE_ENTITY_IDS.forEach(entityId => {
+          this.objects.children.forEach(obj => {
+            if (obj.userData && obj.userData.entityId === entityId) {
+              obj.visible = (obj.userData.viewType === viewType)
+            }
+          })
+        })
+        console.log('所有实体已统一到视图:', viewType)
+        this.$message.success(`所有实体已切换到 ${viewType}`)
       },
 
       // 设置实体 Layer
@@ -2080,7 +2664,8 @@
       getMarsActiveView(entityId) {
         const entityMap = this.marsEntities.get(entityId)
         if (!entityMap) return 'MeshView'
-        return entityMap.get('activeView').toString()
+        const activeViewValue = entityMap.get('activeView')
+        return activeViewValue ? activeViewValue.toString() : 'MeshView'
       },
 
       // ============================================
@@ -2092,8 +2677,7 @@
         console.log('开始初始化实验场景...')
         
         // 清理旧的办公工位模型
-        const officeEntityIds = ['desk_1', 'chair_1', 'monitor_1', 'lamp_1', 'cabinet_1']
-        officeEntityIds.forEach(entityId => {
+        OFFICE_ENTITY_IDS.forEach(entityId => {
           this.removeObjectByEntityId(entityId)
         })
         
@@ -2235,24 +2819,9 @@
 
       // 加载微型办公工位场景（5个实体）
       loadOfficeEntities() {
-        // 实体配置
-        const officeEntities = [
-          { id: 'desk_1', name: '办公桌', glb: 'Adjustable Desk.glb', ply: 'Adjustable Desk.ply', vox: 'Adjustable Desk.glb' },
-          { id: 'chair_1', name: '人体工学椅', glb: 'Executive Chair.glb', ply: 'Executive Chair.ply', vox: 'Executive Chair.glb' },
-          { id: 'monitor_1', name: '显示器', glb: 'Monitor.glb', ply: 'Monitor.ply', vox: 'Monitor.glb' },
-          { id: 'lamp_1', name: '台灯', glb: 'Desk Lamp.glb', ply: 'Desk Lamp.ply', vox: 'Desk Lamp.glb' },
-          { id: 'cabinet_1', name: '文件柜', glb: 'Cabinet.glb', ply: 'Cabinet.ply', vox: 'Cabinet.glb' }
-        ]
-
-        const basePath = '/modelingsrc'
-        const positions = [-30, -15, 0, 15, 30]  // X轴位置分布
-
-        officeEntities.forEach((config, index) => {
-          const xPos = positions[index]
-
-          const gridPath = `${basePath}/网格/${config.glb}`
-          const voxelPath = `${basePath}/体素/${config.vox}`
-          const cloudPath = `${basePath}/点云/${config.ply}`
+        OFFICE_ENTITIES.forEach((config) => {
+          const xPos = config.x
+          const { gridPath, voxelPath, cloudPath } = getOfficeEntityViewPaths(config)
 
           // 先创建 MARS CRDT 实体
           const entityMap = this.createMarsEntity(config.id)
@@ -2265,6 +2834,16 @@
           const cloudPointView = entityMap.get('cloudPointView')
           cloudPointView.delete(0, cloudPointView.length)
           cloudPointView.insert(0, cloudPath)
+          const appearance = entityMap.get('appearance')
+          appearance.delete(0, appearance.length)
+          appearance.insert(0, JSON.stringify({
+            color: '#000000',
+            opacity: 1.0,
+            metalness: 0.3,
+            roughness: 0.7,
+            transparent: false,
+            wireframe: false
+          }))
           entityMap.get('transform').delete(0, entityMap.get('transform').length)
           entityMap.get('transform').insert(0, JSON.stringify({
             x: xPos, y: 0, z: 0,
@@ -2282,7 +2861,18 @@
           this.loadCloudPointView(config.id, cloudPath, xPos)
         })
 
-        console.log('微型办公工位场景加载完成')
+        console.log('微型办公工位场景加载中...')
+
+        // 等待所有模型加载完成后刷新场景树；实验对象保持共存显示
+        const checkAndReset = () => {
+          if (this.loadingOfficeEntities.size === 0) {
+            this.updateSceneTree()
+            this.$message.success('实验场景加载完成')
+          } else {
+            setTimeout(checkAndReset, 500)
+          }
+        }
+        setTimeout(checkAndReset, 1000)
       },
 
       // 模型归一化处理 - 仅标准化尺寸，不修改位置
@@ -2329,9 +2919,7 @@
         const self = this
 
         // 检查是否已经存在相同的模型
-        const existingModel = self.objects.children.find(obj => {
-          return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'GridView'
-        })
+        const existingModel = findOfficeViewObject(self.objects, entityId, 'GridView')
         
         if (existingModel) {
           console.log(`模型 ${entityId}_GridView 已存在，跳过加载`)
@@ -2341,9 +2929,7 @@
 
         loader.load(url, (gltf) => {
           // 二次检查：防止重复添加（如快速点击初始化按钮）
-          const existingModel = self.objects.children.find(obj => {
-            return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'GridView'
-          })
+          const existingModel = findOfficeViewObject(self.objects, entityId, 'GridView')
           if (existingModel) {
             console.log(`模型 ${entityId}_GridView 已存在，跳过添加`)
             self.loadingOfficeEntities.delete(entityId)
@@ -2351,43 +2937,26 @@
           }
 
           const mesh = gltf.scene
-          mesh.name = `${entityId}_GridView`
-          mesh.userData.viewType = 'GridView'
-          mesh.userData.entityId = entityId
-
           // 归一化处理
           self.normalizeModel(mesh, 15)
+          applyBlackMaterial(mesh, THREE)
           // 调整初始位置
-          let positionOffset = { x: 0, y: 0, z: 0 };
-          switch(entityId) {
-            case 'desk_1':
-              positionOffset = { x: 0, y: 0, z: 0 }; // 办公桌
-              break;
-            case 'chair_1':
-              positionOffset = { x: 0, y: 0, z: 0 }; // 人体工学椅
-              break;
-            case 'monitor_1':
-              positionOffset = { x: 0, y: 0, z: 0 }; // 显示器
-              break;
-            case 'lamp_1':
-              positionOffset = { x: 0, y: 0, z: 0 }; // 台灯
-              break;
-            case 'cabinet_1':
-              positionOffset = { x: 0, y: 0, z: 0 }; // 文件柜
-              break;
-            default:
-              positionOffset = { x: 0, y: 0, z: 0 };
-          }
+          const positionOffset = getOfficeViewOffset(entityId, 'GridView')
           mesh.position.x = xPos + positionOffset.x;
           mesh.position.y = positionOffset.y;
           mesh.position.z = positionOffset.z;
           console.log(`处理 ${entityId} 网格模型，位置偏移:`, positionOffset);
-          mesh.visible = true
+          registerOfficeViewObject({
+            objectsGroup: self.objects,
+            ecsWorld: self.ecsWorld,
+            entityId,
+            viewType: 'GridView',
+            object: mesh,
+            path: url,
+            visible: true
+          })
 
-          self.objects.add(mesh)
-
-          mesh.userData.layer = 1
-          mesh.renderOrder = 1000
+          self.syncViewEditFromCRDT(entityId, self.marsEntities.get(entityId), 'GridView')
 
           // 为模型添加控制器
           self.addModelController(mesh)
@@ -2401,13 +2970,10 @@
 
           console.log(`加载 GridView: ${entityId}`)
           // 更新场景树
-          self.updateSceneTree()
-          // 清除加载标记
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         }, undefined, (error) => {
           console.warn(`GridView 加载失败 ${entityId}:`, error)
-          self.updateSceneTree()
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         })
       },
 
@@ -2420,9 +2986,7 @@
         const self = this
 
         // 检查是否已经存在相同的模型
-        const existingModel = self.objects.children.find(obj => {
-          return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'VoxelView'
-        })
+        const existingModel = findOfficeViewObject(self.objects, entityId, 'VoxelView')
         
         if (existingModel) {
           console.log(`模型 ${entityId}_VoxelView 已存在，跳过加载`)
@@ -2432,9 +2996,7 @@
 
         loader.load(url, (gltf) => {
           // 二次检查：防止重复添加
-          const existingModel = self.objects.children.find(obj => {
-            return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'VoxelView'
-          })
+          const existingModel = findOfficeViewObject(self.objects, entityId, 'VoxelView')
           if (existingModel) {
             console.log(`模型 ${entityId}_VoxelView 已存在，跳过添加`)
             self.loadingOfficeEntities.delete(entityId)
@@ -2442,90 +3004,40 @@
           }
 
           const voxel = gltf.scene.clone()
-          voxel.name = `${entityId}_VoxelView`
-          voxel.userData.viewType = 'VoxelView'
-          voxel.userData.entityId = entityId
-          voxel.userData.selectable = true
-
           // 归一化处理（与网格一致）
           self.normalizeModel(voxel, 15)
 
           // 为每个模型设置单独的体素缩放因子
-          let voxelScale;
-          switch(entityId) {
-            case 'desk_1':
-              voxelScale = 0.075; // 办公桌
-              break;
-            case 'chair_1':
-              voxelScale = 0.1; // 人体工学椅
-              break;
-            case 'monitor_1':
-              voxelScale = 0.28; // 显示器
-              break;
-            case 'lamp_1':
-              voxelScale = 0.35; // 台灯
-              break;
-            case 'cabinet_1':
-              voxelScale = 0.3; // 文件柜
-              break;
-            default:
-              voxelScale = 10; // 默认缩放
-          }
+          const voxelScale = getOfficeVoxelScale(entityId)
           voxel.scale.set(voxelScale, voxelScale, voxelScale);
           console.log(`处理 ${entityId} 体素模型，缩放: ${voxelScale}`);
 
           // 调整初始位置
-          let positionOffset = { x: 0, y: 0, z: 0 };
-          switch(entityId) {
-            case 'desk_1':
-              positionOffset = { x: 0, y: 0, z: -5 }; // 办公桌
-              break;
-            case 'chair_1':
-              positionOffset = { x: 0, y: 0, z: 0 }; // 人体工学椅
-              break;
-            case 'monitor_1':
-              positionOffset = { x: -5, y: 0, z: 0 }; // 显示器
-              break;
-            case 'lamp_1':
-              positionOffset = { x: 0, y: 0, z: -2.5 }; // 台灯
-              break;
-            case 'cabinet_1':
-              positionOffset = { x: -5, y: 0, z: -9 }; // 文件柜
-              break;
-            default:
-              positionOffset = { x: 0, y: 0, z: 0 };
-          }
+          const positionOffset = getOfficeViewOffset(entityId, 'VoxelView')
           voxel.position.x = xPos + positionOffset.x;
           voxel.position.y = positionOffset.y;
           voxel.position.z = positionOffset.z;
           console.log(`处理 ${entityId} 体素模型，位置偏移:`, positionOffset);
 
           // 线框风格表现体素感
-          voxel.traverse((child) => {
-            if (child.isMesh) {
-              child.material = new THREE.MeshBasicMaterial({
-                color: 0x888888,
-                wireframe: true
-              })
-            }
+          applyVoxelWireframe(voxel, THREE)
+          applyBlackMaterial(voxel, THREE)
+          registerOfficeViewObject({
+            objectsGroup: self.objects,
+            ecsWorld: self.ecsWorld,
+            entityId,
+            viewType: 'VoxelView',
+            object: voxel,
+            path: url,
+            visible: true
           })
-
-          // 默认不显示
-          voxel.visible = false
-
-          self.objects.add(voxel)
-          voxel.userData.layer = 1
-          voxel.renderOrder = 1000
 
           console.log(`加载 VoxelView: ${entityId}`)
           // 更新场景树
-          self.updateSceneTree()
-          // 清除加载标记
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         }, undefined, (error) => {
           console.warn(`VoxelView 加载失败 ${entityId}:`, error)
-          self.updateSceneTree()
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         })
       },
 
@@ -2538,9 +3050,7 @@
         const self = this
 
         // 检查是否已经存在相同的模型
-        const existingModel = self.objects.children.find(obj => {
-          return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'CloudPointView'
-        })
+        const existingModel = findOfficeViewObject(self.objects, entityId, 'CloudPointView')
         
         if (existingModel) {
           console.log(`模型 ${entityId}_CloudPointView 已存在，跳过加载`)
@@ -2550,9 +3060,7 @@
 
         loader.load(url, (geometry) => {
           // 二次检查：防止重复添加
-          const existingModel = self.objects.children.find(obj => {
-            return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'CloudPointView'
-          })
+          const existingModel = findOfficeViewObject(self.objects, entityId, 'CloudPointView')
           if (existingModel) {
             console.log(`模型 ${entityId}_CloudPointView 已存在，跳过添加`)
             self.loadingOfficeEntities.delete(entityId)
@@ -2563,7 +3071,7 @@
           const processedGeometry = self.preprocessPointCloud(geometry)
           
           const material = new THREE.PointsMaterial({
-            color: 0x00ff00,
+            color: 0x000000,
             size: 5.0,
             transparent: false,
             opacity: 1.0,
@@ -2573,60 +3081,18 @@
           })
 
           const pointCloud = new THREE.Points(processedGeometry, material)
-          pointCloud.name = `${entityId}_CloudPointView`
-          pointCloud.userData.viewType = 'CloudPointView'
-          pointCloud.userData.entityId = entityId
-          pointCloud.userData.selectable = true
-
           // 归一化处理（与网格一致）
           self.normalizeModel(pointCloud, 15)
+          applyBlackMaterial(pointCloud, THREE)
 
           // 调整点云大小
-          let pointCloudScale;
-          switch(entityId) {
-            case 'desk_1':
-              pointCloudScale = 0.5; // 办公桌
-              break;
-            case 'chair_1':
-              pointCloudScale = 0.5; // 人体工学椅
-              break;
-            case 'monitor_1':
-              pointCloudScale = 0.5; // 显示器
-              break;
-            case 'lamp_1':
-              pointCloudScale = 0.5; // 台灯
-              break;
-            case 'cabinet_1':
-              pointCloudScale = 0.5; // 文件柜
-              break;
-            default:
-              pointCloudScale = 1; // 默认缩放
-          }
+          const pointCloudScale = getOfficeCloudPointScale(entityId)
           // 应用大小调整
           pointCloud.scale.multiplyScalar(pointCloudScale);
           console.log(`处理 ${entityId} 点云模型，大小缩放: ${pointCloudScale}`);
           
           // 调整三个轴的方向（1或-1）
-          let axisDirection = { x: 1, y: 1, z: 1 };
-          switch(entityId) {
-            case 'desk_1':
-              axisDirection = { x: 1, y: -1, z: 1 }; // 办公桌
-              break;
-            case 'chair_1':
-              axisDirection = { x: 1, y: -1, z: 1 }; // 人体工学椅
-              break;
-            case 'monitor_1':
-              axisDirection = { x: 1, y: -1, z: 1 }; // 显示器
-              break;
-            case 'lamp_1':
-              axisDirection = { x: 1, y: -1, z: 1 }; // 台灯
-              break;
-            case 'cabinet_1':
-              axisDirection = { x: 1, y: -1, z: 1 }; // 文件柜
-              break;
-            default:
-              axisDirection = { x: 1, y: 1, z: 1 };
-          }
+          const axisDirection = getOfficeCloudPointAxisDirection(entityId)
           // 应用轴方向调整
           pointCloud.scale.x *= axisDirection.x;
           pointCloud.scale.y *= axisDirection.y;
@@ -2634,47 +3100,29 @@
           console.log(`处理 ${entityId} 点云模型，轴方向:`, axisDirection);
           
           // 调整初始位置
-          let positionOffset = { x: 0, y: 0, z: -5.0 };
-          switch(entityId) {
-            case 'desk_1':
-              positionOffset = { x: 0, y: 0, z: -5.0 }; // 办公桌
-              break;
-            case 'chair_1':
-              positionOffset = { x: 0, y: 0, z: -5.0 }; // 人体工学椅
-              break;
-            case 'monitor_1':
-              positionOffset = { x: 0, y: 0, z: -5.0 }; // 显示器
-              break;
-            case 'lamp_1':
-              positionOffset = { x: 0, y: 0, z: -5.0 }; // 台灯
-              break;
-            case 'cabinet_1':
-              positionOffset = { x: 0, y: 0, z: -5.0 }; // 文件柜
-              break;
-            default:
-              positionOffset = { x: 0, y: 0, z: 0 };
-          }
+          const positionOffset = getOfficeViewOffset(entityId, 'CloudPointView')
           pointCloud.position.x = xPos + positionOffset.x;
           pointCloud.position.y = positionOffset.y;
           pointCloud.position.z = positionOffset.z;
           console.log(`处理 ${entityId} 点云模型，位置偏移:`, positionOffset);
 
-          // 默认不显示
-          pointCloud.visible = false
+          registerOfficeViewObject({
+            objectsGroup: self.objects,
+            ecsWorld: self.ecsWorld,
+            entityId,
+            viewType: 'CloudPointView',
+            object: pointCloud,
+            path: url,
+            visible: true
+          })
 
-          self.objects.add(pointCloud)
-          pointCloud.userData.layer = 1
-          pointCloud.renderOrder = 1000
-
+          self.syncViewEditFromCRDT(entityId, self.marsEntities.get(entityId), 'CloudPointView')
           console.log(`加载 CloudPointView: ${entityId}`)
           // 更新场景树
-          self.updateSceneTree()
-          // 清除加载标记
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         }, undefined, (error) => {
           console.warn(`CloudPointView 加载失败 ${entityId}:`, error)
-          self.updateSceneTree()
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         })
       },
 
@@ -2684,9 +3132,7 @@
         const self = this
 
         // 检查是否已经存在相同的模型
-        const existingModel = self.objects.children.find(obj => {
-          return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'GridView'
-        })
+        const existingModel = findOfficeViewObject(self.objects, entityId, 'GridView')
 
         if (existingModel) {
           console.log(`模型 ${entityId}_GridView 已存在，跳过从CRDT加载`)
@@ -2697,9 +3143,7 @@
 
         loader.load(url, (gltf) => {
           // 二次检查：防止重复添加
-          const existingModel = self.objects.children.find(obj => {
-            return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'GridView'
-          })
+          const existingModel = findOfficeViewObject(self.objects, entityId, 'GridView')
           if (existingModel) {
             console.log(`模型 ${entityId}_GridView 已存在，跳过从CRDT添加`)
             self.loadingOfficeEntities.delete(entityId)
@@ -2707,12 +3151,9 @@
           }
 
           const mesh = gltf.scene
-          mesh.name = `${entityId}_GridView`
-          mesh.userData.viewType = 'GridView'
-          mesh.userData.entityId = entityId
-
           // 归一化处理（居中子Mesh + 统一尺寸）
           self.normalizeModel(mesh, 15)
+          applyBlackMaterial(mesh, THREE)
           const normalizedScale = mesh.scale.clone()
 
           // 使用CRDT中的transform设置位置和旋转
@@ -2725,19 +3166,43 @@
             mesh.scale.set(transform.sx, transform.sy, transform.sz)
           }
 
-          mesh.visible = true
-          self.objects.add(mesh)
+          registerOfficeViewObject({
+            objectsGroup: self.objects,
+            ecsWorld: self.ecsWorld,
+            entityId,
+            viewType: 'GridView',
+            object: mesh,
+            path: url,
+            visible: true
+          })
 
-          mesh.userData.layer = 1
-          mesh.renderOrder = 1000
+          self.syncViewEditFromCRDT(entityId, self.marsEntities.get(entityId), 'GridView')
+
+          // 应用 CRDT 中的外观设置（协同同步）
+          const entityMap = self.marsEntities.get(entityId)
+          if (entityMap) {
+            const appearanceValue = entityMap.get('appearance')
+            const appearanceText = appearanceValue ? appearanceValue.toString() : ''
+            if (appearanceText) {
+              try {
+                const appearance = self.getExperimentAppearance(entityId, JSON.parse(appearanceText))
+                self._applyAppearanceToObject(mesh, {
+                  color: appearance.color,
+                  opacity: appearance.opacity !== undefined ? appearance.opacity : 1.0,
+                  metalness: appearance.metalness !== undefined ? appearance.metalness : 0.3,
+                  roughness: appearance.roughness !== undefined ? appearance.roughness : 0.7,
+                  transparent: appearance.transparent || false,
+                  wireframe: appearance.wireframe || false
+                })
+              } catch (e) {}
+            }
+          }
 
           console.log(`从CRDT加载 GridView: ${entityId}, 位置:`, transform)
-          self.updateSceneTree()
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         }, undefined, (error) => {
           console.warn(`GridView 加载失败 ${entityId}:`, error)
-          self.updateSceneTree()
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         })
       },
 
@@ -2747,9 +3212,7 @@
         const self = this
 
         // 检查是否已经存在相同的模型
-        const existingModel = self.objects.children.find(obj => {
-          return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'VoxelView'
-        })
+        const existingModel = findOfficeViewObject(self.objects, entityId, 'VoxelView')
 
         if (existingModel) {
           console.log(`模型 ${entityId}_VoxelView 已存在，跳过从CRDT加载`)
@@ -2760,9 +3223,7 @@
 
         loader.load(url, (gltf) => {
           // 二次检查：防止重复添加
-          const existingModel = self.objects.children.find(obj => {
-            return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'VoxelView'
-          })
+          const existingModel = findOfficeViewObject(self.objects, entityId, 'VoxelView')
           if (existingModel) {
             console.log(`模型 ${entityId}_VoxelView 已存在，跳过从CRDT添加`)
             self.loadingOfficeEntities.delete(entityId)
@@ -2770,65 +3231,36 @@
           }
 
           const voxel = gltf.scene.clone()
-          voxel.name = `${entityId}_VoxelView`
-          voxel.userData.viewType = 'VoxelView'
-          voxel.userData.entityId = entityId
-          voxel.userData.selectable = true
-
           // 归一化处理
           self.normalizeModel(voxel, 15)
 
           // 为每个模型设置单独的体素缩放因子
-          let voxelScale;
-          switch(entityId) {
-            case 'desk_1':
-              voxelScale = 0.075;
-              break;
-            case 'chair_1':
-              voxelScale = 0.1;
-              break;
-            case 'monitor_1':
-              voxelScale = 0.28;
-              break;
-            case 'lamp_1':
-              voxelScale = 0.35;
-              break;
-            case 'cabinet_1':
-              voxelScale = 0.3;
-              break;
-            default:
-              voxelScale = 10;
-          }
+          const voxelScale = getOfficeVoxelScale(entityId)
           voxel.scale.set(voxelScale, voxelScale, voxelScale)
 
           // 线框风格表现体素感
-          voxel.traverse((child) => {
-            if (child.isMesh) {
-              child.material = new THREE.MeshBasicMaterial({
-                color: 0x888888,
-                wireframe: true
-              })
-            }
-          })
+          applyVoxelWireframe(voxel, THREE)
+          applyBlackMaterial(voxel, THREE)
 
           // 使用CRDT中的transform设置位置和旋转
           voxel.position.set(transform.x, transform.y, transform.z)
           voxel.rotation.set(transform.rx, transform.ry, transform.rz)
 
-          // 默认不显示
-          voxel.visible = false
-
-          self.objects.add(voxel)
-          voxel.userData.layer = 1
-          voxel.renderOrder = 1000
+          registerOfficeViewObject({
+            objectsGroup: self.objects,
+            ecsWorld: self.ecsWorld,
+            entityId,
+            viewType: 'VoxelView',
+            object: voxel,
+            path: url,
+            visible: true
+          })
 
           console.log(`从CRDT加载 VoxelView: ${entityId}, 位置:`, transform)
-          self.updateSceneTree()
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         }, undefined, (error) => {
           console.warn(`VoxelView 加载失败 ${entityId}:`, error)
-          self.updateSceneTree()
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         })
       },
 
@@ -2838,9 +3270,7 @@
         const self = this
 
         // 检查是否已经存在相同的模型
-        const existingModel = self.objects.children.find(obj => {
-          return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'CloudPointView'
-        })
+        const existingModel = findOfficeViewObject(self.objects, entityId, 'CloudPointView')
 
         if (existingModel) {
           console.log(`模型 ${entityId}_CloudPointView 已存在，跳过从CRDT加载`)
@@ -2851,9 +3281,7 @@
 
         loader.load(url, (geometry) => {
           // 二次检查：防止重复添加
-          const existingModel = self.objects.children.find(obj => {
-            return obj.userData && obj.userData.entityId === entityId && obj.userData.viewType === 'CloudPointView'
-          })
+          const existingModel = findOfficeViewObject(self.objects, entityId, 'CloudPointView')
           if (existingModel) {
             console.log(`模型 ${entityId}_CloudPointView 已存在，跳过从CRDT添加`)
             self.loadingOfficeEntities.delete(entityId)
@@ -2864,7 +3292,7 @@
           const processedGeometry = self.preprocessPointCloud(geometry)
 
           const material = new THREE.PointsMaterial({
-            color: 0x00ff00,
+            color: 0x000000,
             size: 5.0,
             transparent: false,
             opacity: 1.0,
@@ -2874,50 +3302,16 @@
           })
 
           const pointCloud = new THREE.Points(processedGeometry, material)
-          pointCloud.name = `${entityId}_CloudPointView`
-          pointCloud.userData.viewType = 'CloudPointView'
-          pointCloud.userData.entityId = entityId
-          pointCloud.userData.selectable = true
-
           // 归一化处理
           self.normalizeModel(pointCloud, 15)
+          applyBlackMaterial(pointCloud, THREE)
 
           // 调整点云大小
-          let pointCloudScale;
-          switch(entityId) {
-            case 'desk_1':
-              pointCloudScale = 0.5;
-              break;
-            case 'chair_1':
-              pointCloudScale = 0.5;
-              break;
-            case 'monitor_1':
-              pointCloudScale = 0.5;
-              break;
-            case 'lamp_1':
-              pointCloudScale = 0.5;
-              break;
-            case 'cabinet_1':
-              pointCloudScale = 0.5;
-              break;
-            default:
-              pointCloudScale = 1;
-          }
+          const pointCloudScale = getOfficeCloudPointScale(entityId)
           pointCloud.scale.multiplyScalar(pointCloudScale)
 
           // 调整轴方向
-          let axisDirection = { x: 1, y: 1, z: 1 };
-          switch(entityId) {
-            case 'desk_1':
-            case 'chair_1':
-            case 'monitor_1':
-            case 'lamp_1':
-            case 'cabinet_1':
-              axisDirection = { x: 1, y: -1, z: 1 };
-              break;
-            default:
-              axisDirection = { x: 1, y: 1, z: 1 };
-          }
+          const axisDirection = getOfficeCloudPointAxisDirection(entityId)
           pointCloud.scale.x *= axisDirection.x;
           pointCloud.scale.y *= axisDirection.y;
           pointCloud.scale.z *= axisDirection.z;
@@ -2926,20 +3320,22 @@
           pointCloud.position.set(transform.x, transform.y, transform.z)
           pointCloud.rotation.set(transform.rx, transform.ry, transform.rz)
 
-          // 默认不显示
-          pointCloud.visible = false
+          registerOfficeViewObject({
+            objectsGroup: self.objects,
+            ecsWorld: self.ecsWorld,
+            entityId,
+            viewType: 'CloudPointView',
+            object: pointCloud,
+            path: url,
+            visible: true
+          })
 
-          self.objects.add(pointCloud)
-          pointCloud.userData.layer = 1
-          pointCloud.renderOrder = 1000
-
+          self.syncViewEditFromCRDT(entityId, self.marsEntities.get(entityId), 'CloudPointView')
           console.log(`从CRDT加载 CloudPointView: ${entityId}, 位置:`, transform)
-          self.updateSceneTree()
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         }, undefined, (error) => {
           console.warn(`CloudPointView 加载失败 ${entityId}:`, error)
-          self.updateSceneTree()
-          self.loadingOfficeEntities.delete(entityId)
+          finishOfficeViewLoad(self, entityId)
         })
       },
 
@@ -3376,7 +3772,7 @@
                 this.deleteGroupsContainingModel(delete_children.uuid)
                 
                 this.objects.remove(delete_children)
-                this.scene.remove(this.transformControls)
+                this.resetTransformControls()
               }}
             })
 
@@ -3429,7 +3825,22 @@
         //删除同步
         const Delete_observer = () =>{
           console.log('Delete在变化',this.delete_map.toJSON())
+          const deleteEntityId = this.delete_map.get('entityId')
+          if (deleteEntityId) {
+            this.removeObjectByEntityId(deleteEntityId)
+            if (OFFICE_ENTITY_IDS.includes(deleteEntityId)) {
+              this.deleteMarsEntity(deleteEntityId)
+            }
+            this.logOperation('delete', `Delete Entity: ${deleteEntityId}`)
+            this.delete_map.delete('entityId')
+            this.delete_map.delete('uuid')
+            this.resetTransformControls()
+            this.updateSceneTree()
+            return
+          }
+
           const deleteUuid = this.delete_map.get('uuid')
+          if (!deleteUuid) return
           this.allchildren = this.objects.children
           this.allchildren.forEach((Element,index) => {
             if (Element.uuid === deleteUuid) {
@@ -3443,15 +3854,16 @@
                   this.gui.removeFolder(folder)
                 }
               })
-              if (delete_children instanceof THREE.Mesh) {
+              if (delete_children instanceof THREE.Object3D) {
                 this.deleteGroupsContainingModel(delete_children.uuid)
+                this.clearTransformControlsForObject(delete_children)
                 this.objects.remove(delete_children)
-                this.scene.remove(this.transformControls)
               }
               this.logOperation('delete', `Delete Object: ${deleteName} (${deleteUuid.substring(0,8)}...)`)
             }
           })
-          this.delete_map.delete(0,this.delete_map.length-1)
+          this.delete_map.delete('uuid')
+          this.resetTransformControls()
           this.updateSceneTree()
         }
         //位置同步
@@ -4378,7 +4790,7 @@
         }
         
         // 创建光源文件夹
-        this.lightFolder = this.gui.addFolder('光源设置')
+        this.lightFolder = this.gui.addFolder('Light Settings')
         this.lightFolder.open()
         
         // 根据当前光源类型添加相应的控制器
@@ -4386,7 +4798,7 @@
           // 环境光控制器
           if (this.ambientLight) {
             this.lightFolder.addColor({ color: this.ambientLight.color.getStyle() }, 'color')
-              .name('颜色')
+              .name('Color')
               .onChange((value) => {
                 this.ambientLight.color.set(value)
               })
@@ -4395,62 +4807,62 @@
           // 点光源控制器
           if (this.pointLight) {
             this.lightFolder.addColor({ color: this.pointLight.color.getStyle() }, 'color')
-              .name('颜色')
+              .name('Color')
               .onChange((value) => {
                 this.pointLight.color.set(value)
                 this.updateLightIcon('point')
               })
-            this.lightFolder.add(this.pointLight.position, 'x', -200, 200).name('位置 X').onChange(() => {
+            this.lightFolder.add(this.pointLight.position, 'x', -200, 200).name('Position X').onChange(() => {
               this.updateLightIcon('point')
             })
-            this.lightFolder.add(this.pointLight.position, 'y', -200, 200).name('位置 Y').onChange(() => {
+            this.lightFolder.add(this.pointLight.position, 'y', -200, 200).name('Position Y').onChange(() => {
               this.updateLightIcon('point')
             })
-            this.lightFolder.add(this.pointLight.position, 'z', -200, 200).name('位置 Z').onChange(() => {
+            this.lightFolder.add(this.pointLight.position, 'z', -200, 200).name('Position Z').onChange(() => {
               this.updateLightIcon('point')
             })
-            this.lightFolder.add(this.pointLight, 'intensity', 0, 2).name('强度')
+            this.lightFolder.add(this.pointLight, 'intensity', 0, 2).name('Intensity')
           }
         } else if (this.currentLightType === 'directional') {
           // 定向光控制器
           if (this.directionalLight) {
             this.lightFolder.addColor({ color: this.directionalLight.color.getStyle() }, 'color')
-              .name('颜色')
+              .name('Color')
               .onChange((value) => {
                 this.directionalLight.color.set(value)
                 this.updateLightIcon('directional')
               })
-            this.lightFolder.add(this.directionalLight.position, 'x', -200, 200).name('位置 X').onChange(() => {
+            this.lightFolder.add(this.directionalLight.position, 'x', -200, 200).name('Position X').onChange(() => {
               this.updateLightIcon('directional')
             })
-            this.lightFolder.add(this.directionalLight.position, 'y', -200, 200).name('位置 Y').onChange(() => {
+            this.lightFolder.add(this.directionalLight.position, 'y', -200, 200).name('Position Y').onChange(() => {
               this.updateLightIcon('directional')
             })
-            this.lightFolder.add(this.directionalLight.position, 'z', -200, 200).name('位置 Z').onChange(() => {
+            this.lightFolder.add(this.directionalLight.position, 'z', -200, 200).name('Position Z').onChange(() => {
               this.updateLightIcon('directional')
             })
-            this.lightFolder.add(this.directionalLight, 'intensity', 0, 2).name('强度')
+            this.lightFolder.add(this.directionalLight, 'intensity', 0, 2).name('Intensity')
           }
         } else if (this.currentLightType === 'spot') {
           // 聚光灯控制器
           if (this.spotLight) {
             this.lightFolder.addColor({ color: this.spotLight.color.getStyle() }, 'color')
-              .name('颜色')
+              .name('Color')
               .onChange((value) => {
                 this.spotLight.color.set(value)
                 this.updateLightIcon('spot')
               })
-            this.lightFolder.add(this.spotLight.position, 'x', -200, 200).name('位置 X').onChange(() => {
+            this.lightFolder.add(this.spotLight.position, 'x', -200, 200).name('Position X').onChange(() => {
               this.updateLightIcon('spot')
             })
-            this.lightFolder.add(this.spotLight.position, 'y', -200, 200).name('位置 Y').onChange(() => {
+            this.lightFolder.add(this.spotLight.position, 'y', -200, 200).name('Position Y').onChange(() => {
               this.updateLightIcon('spot')
             })
-            this.lightFolder.add(this.spotLight.position, 'z', -200, 200).name('位置 Z').onChange(() => {
+            this.lightFolder.add(this.spotLight.position, 'z', -200, 200).name('Position Z').onChange(() => {
               this.updateLightIcon('spot')
             })
-            this.lightFolder.add(this.spotLight, 'intensity', 0, 2).name('强度')
-            this.lightFolder.add(this.spotLight, 'angle', 0, Math.PI / 2).name('照射角度').onChange(() => {
+            this.lightFolder.add(this.spotLight, 'intensity', 0, 2).name('Intensity')
+            this.lightFolder.add(this.spotLight, 'angle', 0, Math.PI / 2).name('Spot Angle').onChange(() => {
               this.updateLightIcon('spot')
             })
             // 创建角度控制对象，将弧度转换为角度
@@ -4460,23 +4872,23 @@
               z: 0  // 初始为0度
             }
             
-            // 添加角度控制器
-            this.lightFolder.add(spotLightRotation, 'x', -180, 180).step(1).name('绕x轴旋转').onChange((value) => {
+            // Add rotation controller
+            this.lightFolder.add(spotLightRotation, 'x', -180, 180).step(1).name('Rotation X').onChange((value) => {
               this.spotLight.rotation.x = THREE.MathUtils.degToRad(value)
               this.updateLightIcon('spot')
               this.updateSpotLightDirection()
             })
-            this.lightFolder.add(spotLightRotation, 'y', -180, 180).step(1).name('绕y轴旋转').onChange((value) => {
+            this.lightFolder.add(spotLightRotation, 'y', -180, 180).step(1).name('Rotation Y').onChange((value) => {
               this.spotLight.rotation.y = THREE.MathUtils.degToRad(value)
               this.updateLightIcon('spot')
               this.updateSpotLightDirection()
             })
-            this.lightFolder.add(spotLightRotation, 'z', -180, 180).step(1).name('绕z轴旋转').onChange((value) => {
+            this.lightFolder.add(spotLightRotation, 'z', -180, 180).step(1).name('Rotation Z').onChange((value) => {
               this.spotLight.rotation.z = THREE.MathUtils.degToRad(value)
               this.updateLightIcon('spot')
               this.updateSpotLightDirection()
             })
-            this.lightFolder.add(this.spotLight, 'penumbra', 0, 1).name('半影')
+            this.lightFolder.add(this.spotLight, 'penumbra', 0, 1).name('Penumbra')
           }
         }
       },
@@ -5299,7 +5711,7 @@
             
             // 恢复上次点击的模型颜色为原来的颜色
             if (this.lastIntersect && this.lastIntersect.object.material && this.lastIntersect.object.material.color) {
-              this.lastIntersect.object.material.color.set(0x7777ff)
+              this.restoreObjectSelectionColor(this.lastIntersect.object)
             }
             
             // 设置当前点击的模型颜色为指定颜色
@@ -5335,7 +5747,11 @@
                 // 设置选中模型的颜色（只对 Mesh 有效）
                 this.selectedObjects.forEach(object => {
                   if (object.material && object.material.color) {
-                    object.material.color.set(0xff7777)
+                    if (this.getExperimentEntityIdFromObject(object)) {
+                      object.material.color.set(0x000000)
+                    } else {
+                      object.material.color.set(0xff7777)
+                    }
                   }
                 })
                 
@@ -5379,25 +5795,28 @@
 
               // 只有当点击的不是光源图标时，才添加变换控制器
               if (transformControlsObject && !transformControlsObject.userData.lightType) {
-                console.log('准备附加变换控制器到:', transformControlsObject.name, 'viewType:', transformControlsObject.userData.viewType, 'entityId:', transformControlsObject.userData.entityId)
-                // 只有点击了不同对象时才切换，避免同一对象反复 detach/attach 打断拖动
-                if (this.transformControls.object !== transformControlsObject) {
-                  if (this.transformControls.object) {
-                    this.transformControls.detach()
+                // 如果 ECS 已初始化且该对象是 ECS 实体，跳过旧路径的 attach，让 InputSystem 处理
+                const isEcsEntity = this.ecsInitialized && this.entityManager && transformControlsObject.userData.entityId && this.entityManager.getComponent(transformControlsObject.userData.entityId, 'render')
+                if (!isEcsEntity) {
+                  console.log('准备附加变换控制器到:', transformControlsObject.name, 'viewType:', transformControlsObject.userData.viewType, 'entityId:', transformControlsObject.userData.entityId)
+                  // 只有点击了不同对象时才切换，避免同一对象反复 detach/attach 打断拖动
+                  if (this.transformControls.object !== transformControlsObject) {
+                    if (this.transformControls.object) {
+                      this.resetTransformControls()
+                    }
+                    this.activateTransformControls(transformControlsObject)
+                    console.log('变换控制器已附加')
                   }
-                  this.transformControls.enabled = true
-                  this.transformControls.attach(transformControlsObject)
-                  console.log('变换控制器已附加')
+                } else {
+                  console.log('ECS 实体由 InputSystem 处理变换控制器:', transformControlsObject.userData.entityId)
+                  // 对于 ECS 实体，只需要 detach 当前 transformControls，让 InputSystem 重新 attach
+                  if (this.transformControls.object && this.transformControls.object !== transformControlsObject) {
+                    this.resetTransformControls()
+                  }
                 }
-              } else {
-                console.log('未添加变换控制器: transformControlsObject=', transformControlsObject ? transformControlsObject.name : 'null', 'lightType=', transformControlsObject?.userData?.lightType)
-              }
             } else {
               // 点击空白处：detach 并禁用
-              if (this.transformControls.object) {
-                this.transformControls.detach()
-              }
-              this.transformControls.enabled = false
+              this.resetTransformControls()
             }
             
             // 监听变换控制器模式更改
@@ -5465,12 +5884,13 @@
               // 检查是否点击了光源图标
               if (!clickedObject.userData.lightType) {
                 this.selectedObject = filteredIntersects[0]
-                if (this.selectedObject.object.type === 'Mesh'){
+                if (this.selectedObject && this.selectedObject.object && this.selectedObject.object.type === 'Mesh'){
                   if (this.getObject.length === 0 ){  //如果数组为空，则添加第一个模型到数组里
-                  this.getObject.push(this.selectedObject)}
+                    this.getObject.push(this.selectedObject)
+                  }
                   console.log(this.getObject)
                   // 获取点击的第二个模型，如果第二个模型和第一个是同一个，则不执行
-                  if (this.getObject[0].object.id !== this.selectedObject.object.id){
+                  if (this.getObject[0] && this.getObject[0].object && this.getObject[0].object.id !== this.selectedObject.object.id){
                     //console.log(this.getObject[0].object === this.selectedObject.object)
                     this.getObject[1] = this.selectedObject
                 }}
@@ -5544,13 +5964,29 @@
                 }
               }
             })
+          }
           //删除模块
           }else if (event.button === 1 ){
             this.raycaster.setFromCamera(mouse, this.camera)
-            var intersects = this.raycaster.intersectObjects(this.objects.children)
-            var DeleteId = (intersects[0].object).uuid
-            recordYjsAction('delete', { uuid: DeleteId })
-            this.delete_map.set('uuid',DeleteId)
+            const intersects = this.raycaster.intersectObjects(this.objects.children, true)
+            if (!intersects || intersects.length === 0) {
+              console.log('中键删除：未命中对象')
+              return
+            }
+            const deleteObject = this.getRootSceneObject(intersects[0].object)
+            if (!deleteObject) {
+              console.log('中键删除：未找到可删除的顶层对象')
+              return
+            }
+            const deleteEntityId = deleteObject.userData && deleteObject.userData.entityId
+            if (deleteEntityId && OFFICE_ENTITY_IDS.includes(deleteEntityId)) {
+              recordYjsAction('delete', { entityId: deleteEntityId })
+              this.delete_map.set('entityId', deleteEntityId)
+            } else {
+              var DeleteId = deleteObject.uuid
+              recordYjsAction('delete', { uuid: DeleteId })
+              this.delete_map.set('uuid',DeleteId)
+            }
           }
         })
       },
@@ -6246,6 +6682,8 @@
           this.removeModelController(this.getObject[1].object.name)
           
           // 删除进行布尔操作的原始模型
+          this.clearTransformControlsForObject(this.getObject[0].object)
+          this.clearTransformControlsForObject(this.getObject[1].object)
           this.objects.remove(this.getObject[0].object)
           this.objects.remove(this.getObject[1].object)
           console.log('原始模型已删除')
@@ -6258,7 +6696,7 @@
           this.getObject = [{object: result}]
           
           if (this.transformControls) {
-            this.scene.remove(this.transformControls)
+            this.resetTransformControls()
           }
           
           // 更新场景树，实时反馈操作结果
@@ -6389,7 +6827,7 @@
           // 2. 清理变换控制器
           if (this.transformControls) {
             try {
-              this.scene.remove(this.transformControls)
+              this.resetTransformControls()
               console.log('变换控制器已清理')
             } catch (error) {
               console.warn('清理变换控制器时出错:', error)
@@ -6410,7 +6848,7 @@
           // 1. 清理变换控制器
           if (this.transformControls) {
             try {
-              this.scene.remove(this.transformControls)
+              this.resetTransformControls()
               console.log('变换控制器已清理')
             } catch (error) {
               console.warn('清理变换控制器时出错:', error)
@@ -6605,6 +7043,8 @@
           this.removeModelController(this.getObject[1].object.name)
           
           // 删除进行布尔操作的原始模型
+          this.clearTransformControlsForObject(this.getObject[0].object)
+          this.clearTransformControlsForObject(this.getObject[1].object)
           this.objects.remove(this.getObject[0].object)
           this.objects.remove(this.getObject[1].object)
           console.log('原始模型已删除')
@@ -6617,7 +7057,7 @@
           this.getObject = [{object: result}]
           
           if (this.transformControls) {
-            this.scene.remove(this.transformControls)
+            this.resetTransformControls()
           }
           
           // 更新场景树，实时反馈操作结果
@@ -6725,6 +7165,8 @@
           this.removeModelController(this.getObject[1].object.name)
           
           // 删除进行布尔操作的原始模型
+          this.clearTransformControlsForObject(this.getObject[0].object)
+          this.clearTransformControlsForObject(this.getObject[1].object)
           this.objects.remove(this.getObject[0].object)
           this.objects.remove(this.getObject[1].object)
           console.log('原始模型已删除')
@@ -6737,7 +7179,7 @@
           this.getObject = [{object: result}]
           
           if (this.transformControls) {
-            this.scene.remove(this.transformControls)
+            this.resetTransformControls()
           }
           
           // 更新场景树，实时反馈操作结果
@@ -6754,6 +7196,7 @@
       // 渲染
       render() {
         requestAnimationFrame(this.render)
+        this.syncTransformControlsVisibility()
         if (!this.ecsWorld) {
           this.renderer.render(this.scene, this.camera)
         }
@@ -6764,39 +7207,52 @@
 
       // 保存
       async save(){
-        const sceneData = JSON.stringify(this.scene.toJSON())
-        sessionStorage.setItem('sceneData',sceneData)
-        const documentId = this.$route.params.documentId
-        console.log(documentId)
-        const objectsJson = JSON.stringify(this.objects.toJSON())
-        console.log(objectsJson)
-        const reqData = new URLSearchParams()
-        reqData.append('documentId',documentId)
-        reqData.append('modeldata',objectsJson)
-        const{data:res} = await this.$http.post('/model/saveModel',reqData)
-        if(res.status!==201){
-          return this.$message.error('保存失败')
+        try {
+          const sceneData = JSON.stringify(this.scene.toJSON())
+          sessionStorage.setItem('sceneData',sceneData)
+          const documentId = this.$route.params.documentId
+          console.log(documentId)
+          const objectsJson = JSON.stringify(this.objects.toJSON())
+          console.log(objectsJson)
+          const reqData = new URLSearchParams()
+          reqData.append('documentId',documentId)
+          reqData.append('modeldata',objectsJson)
+          const{data:res} = await this.$http.post('/model/saveModel',reqData)
+          if(!res || res.status!==201){
+            return this.$message.error('保存失败')
+          }
+          this.$message.success('保存成功')
+        } catch (error) {
+          console.error('保存模型时发生错误:', error)
+          this.$message.error('保存失败')
         }
-        this.$message.success('保存成功')
       },
 
       // 从数据库中获取数据
       async getModelData(){
-        const documentId = this.$route.params.documentId
-        const{data:res} = await this.$http.get('/model/getModel', {
-          params:{
-            documentId:documentId
+        try {
+          const documentId = this.$route.params.documentId
+          const{data:res} = await this.$http.get('/model/getModel', {
+            params:{
+              documentId:documentId
+            }
+          })
+          if (res && res.data && res.data.modeldata) {
+            console.log(res.data.modeldata)
+            // this.data = JSON.parse(res.data.modeldata)
+            // console.log(this.data)
+            const loader = new THREE.ObjectLoader()
+            const object = loader.parse(JSON.parse(res.data.modeldata))
+            console.log(object)
+            this.objects=object
+            this.scene.add( this.objects )
+            // this.$message.success('获取成功')
+          } else {
+            console.warn('获取模型数据为空或格式不正确', res)
           }
-        })
-        console.log(res.data.modeldata)
-        // this.data = JSON.parse(res.data.modeldata)
-        // console.log(this.data)
-        const loader = new THREE.ObjectLoader()
-        const object = loader.parse(JSON.parse(res.data.modeldata))
-        console.log(object)
-        this.objects=object
-        this.scene.add( this.objects )
-        // this.$message.success('获取成功')
+        } catch (error) {
+          console.error('获取模型数据时发生错误:', error)
+        }
       },
 
       // 从本地导入模型
@@ -8189,10 +8645,28 @@
     flex: 1;
     overflow-y: auto;
   }
+
+  .view-edit-row {
+    display: grid;
+    grid-template-columns: 72px 56px 56px;
+    align-items: center;
+    column-gap: 8px;
+    margin-top: 6px;
+  }
+
+  .view-edit-row .el-button {
+    width: 56px;
+    margin-left: 0;
+  }
+
+  .view-edit-label {
+    white-space: nowrap;
+  }
   
   /* 确保el-tree适应容器高度 */
   .el-tree {
     max-height: calc(100vh - 250px);
     overflow-y: auto;
   }
+
 </style>

@@ -8,7 +8,7 @@ const Document = db.model('documents', {
     },
     documentId:{
         type:String,
-        require:true
+        required:true
     },
     documentName: {
         type: String,

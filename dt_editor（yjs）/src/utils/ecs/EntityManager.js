@@ -1,7 +1,5 @@
 import * as Y from 'yjs'
 
-let entityIdCounter = 0
-
 export class EntityManager {
   constructor() {
     this.entities = new Map()
@@ -16,8 +14,9 @@ export class EntityManager {
   }
 
   generateEntityId(prefix = 'entity') {
-    entityIdCounter++
-    return `${prefix}_${entityIdCounter}`
+    const time = Date.now().toString(36)
+    const random = Math.random().toString(36).substring(2, 9)
+    return `${prefix}_${time}_${random}`
   }
 
   createEntity(id = null, name = null, components = {}) {
@@ -173,7 +172,6 @@ export class EntityManager {
     for (const id of entityIds) {
       this.removeEntity(id)
     }
-    entityIdCounter = 0
   }
 
   toJSON() {
