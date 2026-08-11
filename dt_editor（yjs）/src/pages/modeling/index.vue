@@ -74,6 +74,25 @@
                 <el-button type="warning" @click="runExperiment1ECS">Experiment 1</el-button>
                 <el-button type="warning" @click="runExperiment2ECS">Experiment 2</el-button>
                 <el-button type="warning" @click="runExperiment3ECS">Experiment 3</el-button>
+                <el-divider direction="vertical"></el-divider>
+                <el-dropdown style="padding-right: 10px;">
+                  <el-button :type="pointCloudEditMode ? 'danger' : 'info'">{{ pointCloudEditMode ? '退出点云编辑' : '点云编辑' }}</el-button>
+                  <el-dropdown-menu slot="dropdown">
+                    <el-dropdown-item @click.native="enterPointCloudEditMode('delete')">笔刷删除（拖拽擦除）</el-dropdown-item>
+                    <el-dropdown-item @click.native="enterPointCloudEditMode('add')">笔刷添加（拖拽添加）</el-dropdown-item>
+                    <el-dropdown-item @click.native="exitPointCloudEditMode()" divided>退出编辑</el-dropdown-item>
+                  </el-dropdown-menu>
+                </el-dropdown>
+                <el-dropdown style="padding-right: 10px;">
+                  <el-button :type="voxelEditMode ? 'danger' : 'info'">{{ voxelEditMode ? '退出体素编辑' : '体素编辑' }}</el-button>
+                  <el-dropdown-menu slot="dropdown">
+                    <el-dropdown-item @click.native="enterVoxelEditMode('place')">放置体素</el-dropdown-item>
+                    <el-dropdown-item @click.native="enterVoxelEditMode('break')">破坏体素</el-dropdown-item>
+                    <el-dropdown-item @click.native="exitVoxelEditMode()" divided>退出编辑</el-dropdown-item>
+                  </el-dropdown-menu>
+                </el-dropdown>
+                <el-button :disabled="!canUndo" @click="undoLastOperation" title="Ctrl+Z">撤销</el-button>
+                <el-button :disabled="!canRedo" @click="redoLastOperation" title="Ctrl+Y">重做</el-button>
               </div>
               <div class="editor_canvas" ref="threeTarget" id="editor_canvas"></div>
               <!-- Operation Log Panel (default on left side) -->
@@ -321,6 +340,21 @@
     createCloudPointEditLayer,
     createGridEditLayer
   } from '@/utils/modeling/officeViewHelpers'
+  import {
+    initViewEditors,
+    createViewEditUndoManager,
+    executePointCloudDelete,
+    executePointCloudAdd,
+    executeVoxelPlace,
+    executeVoxelBreak,
+    screenToNDC,
+    createPointCloudEditor,
+    createVoxelEditor,
+    pushCloudPointOp
+  } from '@/utils/modeling/viewEditIntegration'
+  import { PointCloudEditor } from '@/utils/modeling/PointCloudEditor'
+  import { VoxelEditor } from '@/utils/modeling/VoxelEditor'
+  import { PointCloudDeleteCommand, PointCloudAddCommand } from '@/utils/modeling/ViewEditCommand'
 
   const OFFICE_COLLAB_OBJECT_TYPES = [
     { label: 'GLB图层', value: 'GridView', crdtKey: 'meshView' },
@@ -516,7 +550,20 @@
         showOperationLog: true,
         operationLog: [],
         maxLogEntries: 50,
-        logPanelHeight: 150
+        logPanelHeight: 150,
+        // === 内容级编辑相关 ===
+        pointCloudEditors: {},
+        voxelEditors: {},
+        viewEditUndoManager: null,
+        pointCloudEditMode: false,
+        pointCloudEditType: 'delete',
+        voxelEditMode: false,
+        voxelEditType: 'place',
+        selectionBox: null,
+        // 笔刷选取相关状态
+        _pcIsPainting: false,
+        _pcBrushSelectedIndices: null, // Set: 笔刷过程中选中的原始点 index
+        _pcBrushSelectedData: []       // [{index, x, y, z}]: 供undo用
       }
     },
     mounted(){
@@ -591,6 +638,18 @@
         }
         window.addEventListener('beforeunload', cleanupAwareness)
 
+        // 内容级编辑键盘快捷键
+        window.addEventListener('keydown', (e) => {
+          if (e.ctrlKey && (e.key === 'z' || e.key === 'Z')) {
+            e.preventDefault()
+            this.undoLastOperation()
+          }
+          if (e.ctrlKey && (e.key === 'y' || e.key === 'Y')) {
+            e.preventDefault()
+            this.redoLastOperation()
+          }
+        })
+
         // Listen for awareness state changes and update client list
         this.awareness.on('change', ({ added, updated, removed }) => {
           const states = this.awareness.getStates()
@@ -627,6 +686,14 @@
         })
         console.log(this.clients)
 
+    },
+    computed: {
+      canUndo() {
+        return this.viewEditUndoManager && this.viewEditUndoManager.canUndo()
+      },
+      canRedo() {
+        return this.viewEditUndoManager && this.viewEditUndoManager.canRedo()
+      }
     },
     methods:{
       // Record operation log
@@ -802,6 +869,352 @@
         this.logOperation('async', `${status}: ${details}`)
       },
       
+
+      // ============================================
+      // 内容级编辑：点云与体素
+      // ============================================
+
+      initViewEditors() {
+        if (!this.viewEditUndoManager) {
+          this.viewEditUndoManager = createViewEditUndoManager(50)
+        }
+        initViewEditors(this)
+      },
+
+      enterPointCloudEditMode(type) {
+        // 点云编辑和体素编辑互斥
+        this.exitVoxelEditMode()
+        this.pointCloudEditMode = true
+        this.pointCloudEditType = type
+        if (this.orbitControls) this.orbitControls.enabled = false
+        // 在 canvas 上设置编辑光标
+        if (this.renderer && this.renderer.domElement) {
+          this.renderer.domElement.style.cursor = type === 'delete' ? 'crosshair' : 'cell'
+        }
+        this.$message.info(`点云${type === 'delete' ? '笔刷删除（按住拖拽擦除）' : '笔刷添加（按住拖拽添加）'}模式`)
+        this._bindPointCloudMouseEvents()
+      },
+
+      exitPointCloudEditMode() {
+        if (!this.pointCloudEditMode) return
+        this.pointCloudEditMode = false
+        this._unbindPointCloudMouseEvents()
+        // 恢复 canvas 默认光标
+        if (this.renderer && this.renderer.domElement) {
+          this.renderer.domElement.style.cursor = ''
+        }
+        if (this.orbitControls) this.orbitControls.enabled = true
+        this._pcIsPainting = false
+        this.$message.info('已退出点云编辑模式')
+      },
+
+      enterVoxelEditMode(type) {
+        // 点云编辑和体素编辑互斥
+        this.exitPointCloudEditMode()
+        this.voxelEditMode = true
+        this.voxelEditType = type
+        if (this.orbitControls) this.orbitControls.enabled = false
+        this.$message.info(`体素${type === 'place' ? '放置' : '破坏'}模式`)
+        this._bindVoxelMouseEvents()
+      },
+
+      exitVoxelEditMode() {
+        if (!this.voxelEditMode) return
+        this.voxelEditMode = false
+        this._unbindVoxelMouseEvents()
+        if (this.orbitControls) this.orbitControls.enabled = true
+        this.$message.info('已退出体素编辑模式')
+      },
+
+      undoLastOperation() {
+        if (this.viewEditUndoManager && this.viewEditUndoManager.undo()) {
+          this.$message.success('已撤销')
+        }
+      },
+
+      redoLastOperation() {
+        if (this.viewEditUndoManager && this.viewEditUndoManager.redo()) {
+          this.$message.success('已重做')
+        }
+      },
+
+      // ---- 点云鼠标事件 ----
+      _ensurePointCloudEditor(entityId) {
+        if (!entityId) return null
+        let editor = this.pointCloudEditors[entityId]
+        if (!editor) {
+          editor = createPointCloudEditor(this, entityId)
+          if (editor) {
+            this.$set(this.pointCloudEditors, entityId, editor)
+          }
+        }
+        return editor
+      },
+
+      _ensureVoxelEditor(entityId) {
+        if (!entityId) return null
+        let editor = this.voxelEditors[entityId]
+        if (!editor) {
+          editor = createVoxelEditor(this, entityId)
+          if (editor) {
+            this.$set(this.voxelEditors, entityId, editor)
+          }
+        }
+        return editor
+      },
+
+      _bindPointCloudMouseEvents() {
+        if (!this.renderer) return
+        this._pcMouseDown = this._handlePointCloudMouseDown.bind(this)
+        this._pcMouseMove = this._handlePointCloudMouseMove.bind(this)
+        this._pcMouseUp = this._handlePointCloudMouseUp.bind(this)
+        this.renderer.domElement.addEventListener('mousedown', this._pcMouseDown)
+        document.addEventListener('mousemove', this._pcMouseMove)
+        document.addEventListener('mouseup', this._pcMouseUp)
+      },
+
+      _unbindPointCloudMouseEvents() {
+        if (!this.renderer) return
+        if (this._pcMouseDown) {
+          this.renderer.domElement.removeEventListener('mousedown', this._pcMouseDown)
+        }
+        if (this._pcMouseMove) {
+          document.removeEventListener('mousemove', this._pcMouseMove)
+        }
+        if (this._pcMouseUp) {
+          document.removeEventListener('mouseup', this._pcMouseUp)
+        }
+      },
+
+      _handlePointCloudMouseDown(event) {
+        if (event.button !== 0) return
+        if (!this.selectedEntityId) {
+          this.$message.warning('请先选择一个实体')
+          return
+        }
+        const editor = this._ensurePointCloudEditor(this.selectedEntityId)
+        if (!editor) {
+          this.$message.warning('该实体没有可编辑的点云视图，请先切换到 Point Cloud View')
+          return
+        }
+
+        this._pcIsPainting = true
+        if (this.pointCloudEditType === 'delete') {
+          this._pcBrushSelectedIndices = new Set()
+          this._pcBrushSelectedData = []
+        }
+        // 笔刷添加模式：初始化累积数组
+        if (this.pointCloudEditType === 'add') {
+          this._pcBrushSelectedData = [] // 复用该字段存添加的点坐标
+          this._paintAddAtMouse(event)
+        }
+      },
+
+      _handlePointCloudMouseMove(event) {
+        if (!this._pcIsPainting) return
+        if (this.pointCloudEditType === 'delete') {
+          this._paintDeleteAtMouse(event)
+        } else if (this.pointCloudEditType === 'add') {
+          this._paintAddAtMouse(event)
+        }
+      },
+
+      _handlePointCloudMouseUp(event) {
+        if (!this._pcIsPainting) return
+        this._pcIsPainting = false
+
+        if (this.pointCloudEditType === 'delete') {
+          const editor = this._ensurePointCloudEditor(this.selectedEntityId)
+          if (!editor) return
+          const selected = this._pcBrushSelectedData
+          this._pcBrushSelectedIndices = null
+          this._pcBrushSelectedData = []
+
+          if (selected.length === 0) return
+
+          // 笔刷删除：点已在绘制阶段被 markDeleted，用 pushDirect 跳过 execute
+          const cmd = new PointCloudDeleteCommand({
+            editor, box3: null, entityId: this.selectedEntityId, viewType: 'CloudPointView',
+            _brushPoints: selected
+          })
+          this.viewEditUndoManager.pushDirect(cmd, { deletedPoints: selected, affectedCount: selected.length })
+
+          // 同步 CRDT
+          this._syncBrushDeleteToCRDT(editor, selected)
+
+          this.$message.success(`笔刷删除了 ${selected.length} 个点`)
+          this.logOperation('point_cloud', `笔刷删除 ${this.selectedEntityId} ${selected.length} 点`)
+        } else if (this.pointCloudEditType === 'add') {
+          const editor = this._ensurePointCloudEditor(this.selectedEntityId)
+          if (!editor) return
+          const pointsData = this._pcBrushSelectedData
+          this._pcBrushSelectedData = []
+
+          if (pointsData.length === 0) return
+
+          // 笔刷添加：批量推入所有点
+          const cmd = new PointCloudAddCommand({
+            editor, entityId: this.selectedEntityId, viewType: 'CloudPointView',
+            _brushPoints: pointsData
+          })
+          this.viewEditUndoManager.execute(cmd)
+
+          this.$message.success(`笔刷添加了 ${pointsData.length} 个点`)
+          this.logOperation('point_cloud', `笔刷添加 ${this.selectedEntityId} ${pointsData.length} 点`)
+        }
+      },
+
+      /**
+       * 鼠标移动时，射线命中点云模型，找到球体内的点，加入笔刷选区并实时删除
+       */
+      _paintDeleteAtMouse(event) {
+        const editor = this._ensurePointCloudEditor(this.selectedEntityId)
+        if (!editor) return
+        const ndc = screenToNDC(event, this.renderer)
+        const raycaster = new THREE.Raycaster()
+        raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), this.camera)
+        // 射线直接命中点云对象，获取3D表面位置
+        const hits = raycaster.intersectObject(editor.pointsObject)
+        if (hits.length === 0) return
+        const hitPoint = hits[0].point
+
+        const found = editor.findPointsInSphere(hitPoint, 3.0)
+        let newCount = 0
+        for (const p of found) {
+          if (!this._pcBrushSelectedIndices.has(p.index)) {
+            this._pcBrushSelectedIndices.add(p.index)
+            this._pcBrushSelectedData.push(p)
+            newCount++
+          }
+        }
+        if (newCount > 0) {
+          editor.markDeleted(found.filter(p => this._pcBrushSelectedIndices.has(p.index)))
+        }
+      },
+
+      /**
+       * 笔刷添加：在鼠标射线命中处添加点
+       */
+      _paintAddAtMouse(event) {
+        const editor = this._ensurePointCloudEditor(this.selectedEntityId)
+        if (!editor) return
+        const ndc = screenToNDC(event, this.renderer)
+        const raycaster = new THREE.Raycaster()
+        raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), this.camera)
+        const hits = raycaster.intersectObject(editor.pointsObject)
+        if (hits.length === 0) return
+        const hitPoint = hits[0].point
+        // 转为局部坐标后生成少量点坐标并累积，松手时统一添加
+        const invMatrix = new THREE.Matrix4().copy(editor.pointsObject.matrixWorld).invert()
+        const localCenter = hitPoint.clone().applyMatrix4(invMatrix)
+        for (let i = 0; i < 5; i++) {
+          const u = Math.random(), v = Math.random()
+          const theta = 2 * Math.PI * u, phi = Math.acos(2 * v - 1)
+          const r = 1.5 * Math.cbrt(Math.random())
+          this._pcBrushSelectedData.push({
+            x: localCenter.x + r * Math.sin(phi) * Math.cos(theta),
+            y: localCenter.y + r * Math.sin(phi) * Math.sin(theta),
+            z: localCenter.z + r * Math.cos(phi)
+          })
+        }
+      },
+
+      /**
+       * 同步笔刷删除的包围盒到 CRDT
+       */
+      _syncBrushDeleteToCRDT(editor, selected) {
+        if (selected.length === 0) return
+        const worldPos = new THREE.Vector3()
+        const mat = editor.pointsObject.matrixWorld
+        let minX = Infinity, minY = Infinity, minZ = Infinity
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
+        for (const p of selected) {
+          worldPos.set(p.x, p.y, p.z).applyMatrix4(mat)
+          if (worldPos.x < minX) minX = worldPos.x
+          if (worldPos.y < minY) minY = worldPos.y
+          if (worldPos.z < minZ) minZ = worldPos.z
+          if (worldPos.x > maxX) maxX = worldPos.x
+          if (worldPos.y > maxY) maxY = worldPos.y
+          if (worldPos.z > maxZ) maxZ = worldPos.z
+        }
+        pushCloudPointOp(this, this.selectedEntityId, 'delete_box', {
+          min: { x: minX, y: minY, z: minZ },
+          max: { x: maxX, y: maxY, z: maxZ }
+        })
+      },
+
+      _raycastGround(ndc) {
+        if (!this.camera) return null
+        const raycaster = new THREE.Raycaster()
+        raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), this.camera)
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
+        const target = new THREE.Vector3()
+        raycaster.ray.intersectPlane(plane, target)
+        return target
+      },
+
+      // ---- 体素鼠标事件 ----
+      _bindVoxelMouseEvents() {
+        if (!this.renderer) return
+        this._voxelClick = this._handleVoxelClick.bind(this)
+        this.renderer.domElement.addEventListener('click', this._voxelClick)
+      },
+
+      _unbindVoxelMouseEvents() {
+        if (!this.renderer) return
+        if (this._voxelClick) {
+          this.renderer.domElement.removeEventListener('click', this._voxelClick)
+        }
+      },
+
+      _handleVoxelClick(event) {
+        if (!this.selectedEntityId) {
+          this.$message.warning('请先选择一个实体')
+          return
+        }
+        const editor = this._ensureVoxelEditor(this.selectedEntityId)
+        if (!editor) {
+          this.$message.warning('该实体没有可编辑的体素视图，请先切换到 Voxel View')
+          return
+        }
+
+        const ndc = screenToNDC(event, this.renderer)
+        const raycaster = new THREE.Raycaster()
+        raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), this.camera)
+
+        if (this.voxelEditType === 'place') {
+          // 在射线前方一点放置（避免与现有体素重叠）
+          const hit = editor.raycastVoxel(raycaster)
+          if (hit) {
+            const placePos = hit.worldPos.clone()
+            const result = executeVoxelPlace(this, this.selectedEntityId, placePos)
+            if (result) {
+              this.$message.success('放置体素')
+              this.logOperation('voxel', `放置 ${this.selectedEntityId} (${result.x},${result.y},${result.z})`)
+            }
+          } else {
+            // 如果没有命中，在射线与地面交点处放置
+            const groundHit = this._raycastGround(ndc)
+            if (groundHit) {
+              const result = executeVoxelPlace(this, this.selectedEntityId, groundHit)
+              if (result) {
+                this.$message.success('放置体素')
+                this.logOperation('voxel', `放置 ${this.selectedEntityId} (${result.x},${result.y},${result.z})`)
+              }
+            }
+          }
+        } else if (this.voxelEditType === 'break') {
+          const hit = editor.raycastVoxel(raycaster)
+          if (hit && editor.getVoxel(hit.x, hit.y, hit.z)) {
+            const result = executeVoxelBreak(this, this.selectedEntityId, hit.worldPos)
+            if (result && result.oldValue) {
+              this.$message.success('破坏体素')
+              this.logOperation('voxel', `破坏 ${this.selectedEntityId} (${result.x},${result.y},${result.z})`)
+            }
+          }
+        }
+      },
+
       // Page close warning
       // beforeunloadHandler(e) {
       //   e = e || window.event
@@ -1233,6 +1646,7 @@
           this.phygitalSyncSystem = new PhygitalSyncSystem()
           this.collabSyncSystem = new CollabSyncSystem(this.doc1, this.crdtSystem)
           this.viewEditSystem = new ViewEditSystem(this.scene, this.crdtSystem)
+          this.viewEditSystem.setVM(this)
 
           this.meshSystem.onEntityCreated = (entityId, mesh) => {
             if (this.gui && mesh) {
@@ -1273,6 +1687,13 @@
 
       initExperimentSceneECS() {
         this.initExperimentScene()
+        // 初始化内容级编辑器
+        if (!this.viewEditUndoManager) {
+          this.viewEditUndoManager = createViewEditUndoManager(50)
+        }
+        this.$nextTick(() => {
+          initViewEditors(this)
+        })
         this.$message.success('实验场景初始化完成')
       },
 

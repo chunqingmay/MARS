@@ -1,7 +1,8 @@
-﻿import * as Y from 'yjs'
+import * as Y from 'yjs'
 import { BaseSystem } from '../SystemManager.js'
 import { entityManager } from '../EntityManager.js'
 import { ComponentTypes, createAppearanceComponent } from '../Components.js'
+import { syncCloudPointOpsFromCRDT, syncVoxelOpsFromCRDT } from '@/utils/modeling/viewEditIntegration'
 
 export class ViewEditSystem extends BaseSystem {
   constructor(scene, crdtSystem = null) {
@@ -10,6 +11,10 @@ export class ViewEditSystem extends BaseSystem {
     this.scene = scene
     this.crdtSystem = crdtSystem
     this.pendingAppearanceUpdates = []
+    this.vm = null
+    // 追踪已处理的操作索引 { entityId: number }
+    this.lastCloudPointOpIndex = new Map()
+    this.lastVoxelOpIndex = new Map()
   }
 
   init() {
@@ -20,7 +25,11 @@ export class ViewEditSystem extends BaseSystem {
     this.crdtSystem = crdtSystem
   }
 
-  // 鏇存柊瀹炰綋澶栬灞炴€?- 鐢卞墠绔?UI 璋冪敤
+  setVM(vm) {
+    this.vm = vm
+  }
+
+  // 更新实体外观属性 - 由前端 UI 调用
   updateAppearance(entityId, appearanceData) {
     let entity = entityManager.getEntity(entityId)
     
@@ -53,7 +62,8 @@ export class ViewEditSystem extends BaseSystem {
       return
     }
 
-    // 鏇存柊澶栬灞炴€?    if (appearanceData.color !== undefined) appearance.color = appearanceData.color
+    // 更新外观属性
+    if (appearanceData.color !== undefined) appearance.color = appearanceData.color
     if (appearanceData.opacity !== undefined) appearance.opacity = appearanceData.opacity
     if (appearanceData.metalness !== undefined) appearance.metalness = appearanceData.metalness
     if (appearanceData.roughness !== undefined) appearance.roughness = appearanceData.roughness
@@ -62,7 +72,7 @@ export class ViewEditSystem extends BaseSystem {
 
     appearance._dirty = true
 
-    // 鏍囪闇€瑕佸悓姝ュ埌 CRDT
+    // 标记需要同步到 CRDT
     this.pendingAppearanceUpdates.push({ entityId })
   }
 
@@ -84,13 +94,14 @@ export class ViewEditSystem extends BaseSystem {
       const appearance = entityManager.getComponent(entity.id, ComponentTypes.APPEARANCE)
       if (!appearance || !appearance._dirty) continue
 
-      // 鍏堝皾璇曢€氳繃 RENDER 缁勪欢鎵惧埌 mesh
+      // 先尝试通过 RENDER 组件找到 mesh
       const render = entityManager.getComponent(entity.id, ComponentTypes.RENDER)
       if (render && render.mesh) {
         console.log(`[ViewEditSystem] Applying appearance to RENDER mesh: ${entity.id}`)
         this._applyAppearanceToMesh(entity.id, render.mesh, appearance)
       } else {
-        // 濡傛灉娌℃湁 RENDER 缁勪欢锛岀洿鎺ラ€氳繃 entityId 鏌ユ壘 Three.js 瀵硅薄骞跺簲鐢?        const mesh = this._findMeshByEntityId(entity.id)
+        // 如果没有 RENDER 组件，直接通过 entityId 查找 Three.js 对象并应用
+        const mesh = this._findMeshByEntityId(entity.id)
         if (mesh) {
           console.log(`[ViewEditSystem] Applying appearance to direct mesh: ${entity.id}`)
           this._applyAppearanceToMesh(entity.id, mesh, appearance)
@@ -102,8 +113,54 @@ export class ViewEditSystem extends BaseSystem {
       appearance._dirty = false
     }
 
-    // 鍚屾澶栬鍙樻洿鍒?CRDT
+    // 同步外观变更到 CRDT
     this._syncPendingAppearanceToCRDT()
+
+    // 同步点云和体素编辑操作（远程 CRDT -> 本地）
+    this._syncViewEditOpsFromCRDT()
+  }
+
+  // 检测 marsEntities 中 cloudPointOps 和 voxelOps 的变化，处理远程操作
+  _syncViewEditOpsFromCRDT() {
+    if (!this.vm || !this.vm.marsEntities) return
+
+    this.vm.marsEntities.forEach((entityMap, entityId) => {
+      // 同步 cloudPointOps
+      const cloudPointOps = entityMap.get('cloudPointOps')
+      if (cloudPointOps instanceof Y.Array) {
+        const lastIdx = this.lastCloudPointOpIndex.get(entityId) || 0
+        const currentLength = cloudPointOps.length
+        if (currentLength > lastIdx) {
+          const newOps = []
+          for (let i = lastIdx; i < currentLength; i++) {
+            newOps.push(cloudPointOps.get(i))
+          }
+          if (newOps.length > 0) {
+            console.log(`[ViewEditSystem] 同步 ${entityId} 的 cloudPointOps: ${newOps.length} 个新操作`)
+            syncCloudPointOpsFromCRDT(this.vm, entityId, newOps)
+          }
+          this.lastCloudPointOpIndex.set(entityId, currentLength)
+        }
+      }
+
+      // 同步 voxelOps
+      const voxelOps = entityMap.get('voxelOps')
+      if (voxelOps instanceof Y.Array) {
+        const lastIdx = this.lastVoxelOpIndex.get(entityId) || 0
+        const currentLength = voxelOps.length
+        if (currentLength > lastIdx) {
+          const newOps = []
+          for (let i = lastIdx; i < currentLength; i++) {
+            newOps.push(voxelOps.get(i))
+          }
+          if (newOps.length > 0) {
+            console.log(`[ViewEditSystem] 同步 ${entityId} 的 voxelOps: ${newOps.length} 个新操作`)
+            syncVoxelOpsFromCRDT(this.vm, entityId, newOps)
+          }
+          this.lastVoxelOpIndex.set(entityId, currentLength)
+        }
+      }
+    })
   }
 
   _syncPendingAppearanceToCRDT() {
@@ -149,7 +206,7 @@ export class ViewEditSystem extends BaseSystem {
         const materials = Array.isArray(obj.material) ? obj.material : [obj.material]
         
         materials.forEach(mat => {
-          // 鏇存柊棰滆壊
+          // 更新颜色
           if (appearance.color) {
             mat.color.set(appearance.color)
           }
@@ -158,7 +215,7 @@ export class ViewEditSystem extends BaseSystem {
           mat.opacity = appearance.opacity
           mat.needsUpdate = true
           
-          // 鏇存柊閲戝睘搴﹀拰绮楃硻搴?(浠呭 MeshStandardMaterial 绛?PBR 鏉愯川鏈夋晥)
+          // 更新金属度和粗糙度(仅对 MeshStandardMaterial 等 PBR 材质有效)
           if (mat.metalness !== undefined) {
             mat.metalness = appearance.metalness
           }
@@ -166,7 +223,7 @@ export class ViewEditSystem extends BaseSystem {
             mat.roughness = appearance.roughness
           }
           
-          // 鏇存柊绾挎妯″紡
+          // 更新线框模式
           mat.wireframe = appearance.wireframe
         })
       }
@@ -180,4 +237,3 @@ export class ViewEditSystem extends BaseSystem {
     traverseAndApply(mesh)
   }
 }
-
