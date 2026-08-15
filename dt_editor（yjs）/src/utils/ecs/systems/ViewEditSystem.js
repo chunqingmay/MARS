@@ -2,7 +2,7 @@ import * as Y from 'yjs'
 import { BaseSystem } from '../SystemManager.js'
 import { entityManager } from '../EntityManager.js'
 import { ComponentTypes, createAppearanceComponent } from '../Components.js'
-import { syncCloudPointOpsFromCRDT, syncVoxelOpsFromCRDT } from '@/utils/modeling/viewEditIntegration'
+import { syncCloudPointOpsFromCRDT, syncVoxelOpsFromCRDT, syncMeshOpsFromCRDT } from '@/utils/modeling/viewEditIntegration'
 
 export class ViewEditSystem extends BaseSystem {
   constructor(scene, crdtSystem = null) {
@@ -15,6 +15,7 @@ export class ViewEditSystem extends BaseSystem {
     // 追踪已处理的操作索引 { entityId: number }
     this.lastCloudPointOpIndex = new Map()
     this.lastVoxelOpIndex = new Map()
+    this.lastMeshOpIndex = new Map()
   }
 
   init() {
@@ -158,6 +159,24 @@ export class ViewEditSystem extends BaseSystem {
             syncVoxelOpsFromCRDT(this.vm, entityId, newOps)
           }
           this.lastVoxelOpIndex.set(entityId, currentLength)
+        }
+      }
+
+      // 同步 meshOps
+      const meshOps = entityMap.get('meshOps')
+      if (meshOps instanceof Y.Array) {
+        const lastIdx = this.lastMeshOpIndex.get(entityId) || 0
+        const currentLength = meshOps.length
+        if (currentLength > lastIdx) {
+          const newOps = []
+          for (let i = lastIdx; i < currentLength; i++) {
+            newOps.push(meshOps.get(i))
+          }
+          if (newOps.length > 0) {
+            console.log(`[ViewEditSystem] 同步 ${entityId} 的 meshOps: ${newOps.length} 个新操作`)
+            syncMeshOpsFromCRDT(this.vm, entityId, newOps)
+          }
+          this.lastMeshOpIndex.set(entityId, currentLength)
         }
       }
     })

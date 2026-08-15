@@ -178,15 +178,35 @@ export class VoxelPlaceCommand extends ViewEditCommand {
     super(options)
     this.editor = options.editor
     this.worldPos = options.worldPos
+    this._brushCells = options._brushCells || null // 笔刷模式：[{x,y,z,oldValue}]
   }
 
   execute() {
-    if (!this.editor || !this.worldPos) return null
+    if (!this.editor) return null
+    // 笔刷模式：批量放置
+    if (this._brushCells && this._brushCells.length > 0) {
+      const cells = []
+      for (const c of this._brushCells) {
+        const oldValue = this.editor.setVoxel(c.x, c.y, c.z, true)
+        cells.push({ x: c.x, y: c.y, z: c.z, oldValue })
+      }
+      this.editor.rebuildMesh()
+      return { cells }
+    }
+    // 单点模式
+    if (!this.worldPos) return null
     return this.editor.placeVoxel(this.worldPos)
   }
 
   undo(saved) {
     if (!this.editor || !saved) return
+    if (saved.cells) {
+      for (const c of saved.cells) {
+        this.editor.setVoxel(c.x, c.y, c.z, c.oldValue)
+      }
+      this.editor.rebuildMesh()
+      return
+    }
     this.editor.setVoxel(saved.x, saved.y, saved.z, saved.oldValue)
     this.editor.rebuildMesh()
   }
@@ -200,17 +220,95 @@ export class VoxelBreakCommand extends ViewEditCommand {
     super(options)
     this.editor = options.editor
     this.worldPos = options.worldPos
+    this._brushCells = options._brushCells || null // 笔刷模式：[{x,y,z,oldValue}]
   }
 
   execute() {
-    if (!this.editor || !this.worldPos) return null
+    if (!this.editor) return null
+    // 笔刷模式：批量破坏
+    if (this._brushCells && this._brushCells.length > 0) {
+      const cells = []
+      for (const c of this._brushCells) {
+        const oldValue = this.editor.setVoxel(c.x, c.y, c.z, false)
+        cells.push({ x: c.x, y: c.y, z: c.z, oldValue })
+      }
+      this.editor.rebuildMesh()
+      return { cells }
+    }
+    // 单点模式
+    if (!this.worldPos) return null
     return this.editor.breakVoxel(this.worldPos)
   }
 
   undo(saved) {
     if (!this.editor || !saved) return
+    if (saved.cells) {
+      for (const c of saved.cells) {
+        this.editor.setVoxel(c.x, c.y, c.z, c.oldValue)
+      }
+      this.editor.rebuildMesh()
+      return
+    }
     this.editor.setVoxel(saved.x, saved.y, saved.z, saved.oldValue)
     this.editor.rebuildMesh()
+  }
+}
+
+// ============================================
+// 网格删面命令
+// ============================================
+export class MeshDeleteCommand extends ViewEditCommand {
+  constructor(options = {}) {
+    super(options)
+    this.editor = options.editor
+    this.faceIds = Array.isArray(options.faceIds)
+      ? options.faceIds
+      : (options.faceId !== undefined ? [options.faceId] : [])
+  }
+
+  execute() {
+    if (!this.editor) return null
+    const affected = []
+    for (const faceId of this.faceIds) {
+      if (this.editor.deleteFace(faceId)) affected.push(faceId)
+    }
+    return { affected }
+  }
+
+  undo() {
+    if (!this.editor) return
+    for (const faceId of this.faceIds) {
+      this.editor.undeleteFace(faceId)
+    }
+  }
+}
+
+// ============================================
+// 网格细分命令
+// ============================================
+export class MeshSubdivideCommand extends ViewEditCommand {
+  constructor(options = {}) {
+    super(options)
+    this.editor = options.editor
+    this.faceIds = Array.isArray(options.faceIds)
+      ? options.faceIds
+      : (options.faceId !== undefined ? [options.faceId] : [])
+  }
+
+  execute() {
+    if (!this.editor) return null
+    const affected = []
+    for (const faceId of this.faceIds) {
+      if (this.editor.subdivideFace(faceId)) affected.push(faceId)
+    }
+    return { affected }
+  }
+
+  undo() {
+    if (!this.editor) return
+    for (const faceId of this.faceIds) {
+      this.editor.unsubdivideFace(faceId)
+    }
   }
 }
 
@@ -227,6 +325,10 @@ export function createViewEditCommand(type, options) {
       return new VoxelPlaceCommand(options)
     case 'voxelBreak':
       return new VoxelBreakCommand(options)
+    case 'meshDelete':
+      return new MeshDeleteCommand(options)
+    case 'meshSubdivide':
+      return new MeshSubdivideCommand(options)
     default:
       console.warn('[createViewEditCommand] Unknown command type:', type)
       return null

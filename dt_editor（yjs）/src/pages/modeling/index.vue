@@ -1,4 +1,4 @@
-﻿<template>
+﻿﻿﻿﻿<template>
     <div>
       <Ball v-for="client in clients" :key="client.clientId" :clientId="client.clientId" :color="client.color" :position="client.position" :userName="client.userName" />
       <el-container>
@@ -89,6 +89,14 @@
                     <el-dropdown-item @click.native="enterVoxelEditMode('place')">放置体素</el-dropdown-item>
                     <el-dropdown-item @click.native="enterVoxelEditMode('break')">破坏体素</el-dropdown-item>
                     <el-dropdown-item @click.native="exitVoxelEditMode()" divided>退出编辑</el-dropdown-item>
+                  </el-dropdown-menu>
+                </el-dropdown>
+                <el-dropdown style="padding-right: 10px;">
+                  <el-button :type="meshEditMode ? 'danger' : 'info'">{{ meshEditMode ? '退出网格编辑' : '网格编辑' }}</el-button>
+                  <el-dropdown-menu slot="dropdown">
+                    <el-dropdown-item @click.native="enterMeshEditMode('delete')">三角面删减（笔刷挖洞）</el-dropdown-item>
+                    <el-dropdown-item @click.native="enterMeshEditMode('subdivide')">网格细分（笔刷加面）</el-dropdown-item>
+                    <el-dropdown-item @click.native="exitMeshEditMode()" divided>退出编辑</el-dropdown-item>
                   </el-dropdown-menu>
                 </el-dropdown>
                 <el-button :disabled="!canUndo" @click="undoLastOperation" title="Ctrl+Z">撤销</el-button>
@@ -343,18 +351,16 @@
   import {
     initViewEditors,
     createViewEditUndoManager,
-    executePointCloudDelete,
-    executePointCloudAdd,
-    executeVoxelPlace,
-    executeVoxelBreak,
     screenToNDC,
     createPointCloudEditor,
     createVoxelEditor,
-    pushCloudPointOp
+    createMeshEditor,
+    pushCloudPointOp,
+    pushMeshOp
   } from '@/utils/modeling/viewEditIntegration'
   import { PointCloudEditor } from '@/utils/modeling/PointCloudEditor'
   import { VoxelEditor } from '@/utils/modeling/VoxelEditor'
-  import { PointCloudDeleteCommand, PointCloudAddCommand } from '@/utils/modeling/ViewEditCommand'
+  import { PointCloudDeleteCommand, PointCloudAddCommand, VoxelPlaceCommand, VoxelBreakCommand, MeshDeleteCommand, MeshSubdivideCommand } from '@/utils/modeling/ViewEditCommand'
 
   const OFFICE_COLLAB_OBJECT_TYPES = [
     { label: 'GLB图层', value: 'GridView', crdtKey: 'meshView' },
@@ -554,16 +560,27 @@
         // === 内容级编辑相关 ===
         pointCloudEditors: {},
         voxelEditors: {},
+        meshEditors: {},
         viewEditUndoManager: null,
         pointCloudEditMode: false,
         pointCloudEditType: 'delete',
         voxelEditMode: false,
         voxelEditType: 'place',
+        meshEditMode: false,
+        meshEditType: 'delete',
         selectionBox: null,
         // 笔刷选取相关状态
         _pcIsPainting: false,
         _pcBrushSelectedIndices: null, // Set: 笔刷过程中选中的原始点 index
-        _pcBrushSelectedData: []       // [{index, x, y, z}]: 供undo用
+        _pcBrushSelectedData: [],      // [{index, x, y, z}]: 供undo用
+        // 体素笔刷相关状态
+        _voxelIsPainting: false,
+        _voxelPaintKeys: null,        // Set: 已处理的格子 key
+        _voxelBrushData: [],          // [{x, y, z, oldValue}]
+        _voxelRebuildScheduled: false,
+        // 网格笔刷相关状态
+        _meshIsPainting: false,
+        _meshPaintFaces: null         // Set: 本次笔刷处理的原始面 index
       }
     },
     mounted(){
@@ -914,7 +931,23 @@
         this.voxelEditMode = true
         this.voxelEditType = type
         if (this.orbitControls) this.orbitControls.enabled = false
-        this.$message.info(`体素${type === 'place' ? '放置' : '破坏'}模式`)
+        // 光标提示
+        if (this.renderer && this.renderer.domElement) {
+          this.renderer.domElement.style.cursor = 'copy'
+        }
+        // 预创建编辑器（首次光栅化有一次性开销），隐藏原始mesh只显示体素
+        if (this.selectedEntityId) {
+          const editor = this._ensureVoxelEditor(this.selectedEntityId)
+          if (editor && editor.hideOriginal) {
+            editor.hideOriginal()
+          }
+          if (!editor) {
+            this.$message.warning('当前选中实体没有可编辑的体素视图，请先切换到 Voxel View')
+          }
+        } else {
+          this.$message.warning('请先点击选择一个实体，再进行体素编辑')
+        }
+        this.$message.info(`体素${type === 'place' ? '放置' : '破坏'}模式：悬停预览，按住拖拽操作`)
         this._bindVoxelMouseEvents()
       },
 
@@ -922,7 +955,19 @@
         if (!this.voxelEditMode) return
         this.voxelEditMode = false
         this._unbindVoxelMouseEvents()
+        if (this.renderer && this.renderer.domElement) {
+          this.renderer.domElement.style.cursor = ''
+        }
+        // 隐藏预览框，恢复原始mesh显示
+        if (this.selectedEntityId) {
+          const editor = this.voxelEditors[this.selectedEntityId]
+          if (editor) {
+            if (editor.updatePreviewBox) editor.updatePreviewBox(null)
+            if (editor.showOriginal) editor.showOriginal()
+          }
+        }
         if (this.orbitControls) this.orbitControls.enabled = true
+        this._voxelIsPainting = false
         this.$message.info('已退出体素编辑模式')
       },
 
@@ -1143,31 +1188,39 @@
         })
       },
 
-      _raycastGround(ndc) {
-        if (!this.camera) return null
-        const raycaster = new THREE.Raycaster()
-        raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), this.camera)
-        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
-        const target = new THREE.Vector3()
-        raycaster.ray.intersectPlane(plane, target)
-        return target
-      },
-
-      // ---- 体素鼠标事件 ----
+      // ---- 体素鼠标事件（笔刷模式：拖拽连续放置/破坏 + 悬停预览）----
       _bindVoxelMouseEvents() {
         if (!this.renderer) return
-        this._voxelClick = this._handleVoxelClick.bind(this)
-        this.renderer.domElement.addEventListener('click', this._voxelClick)
+        this._voxelDown = this._handleVoxelMouseDown.bind(this)
+        this._voxelMove = this._handleVoxelMouseMove.bind(this)
+        this._voxelUp = this._handleVoxelMouseUp.bind(this)
+        this.renderer.domElement.addEventListener('mousedown', this._voxelDown)
+        document.addEventListener('mousemove', this._voxelMove)
+        document.addEventListener('mouseup', this._voxelUp)
       },
 
       _unbindVoxelMouseEvents() {
         if (!this.renderer) return
-        if (this._voxelClick) {
-          this.renderer.domElement.removeEventListener('click', this._voxelClick)
+        if (this._voxelDown) {
+          this.renderer.domElement.removeEventListener('mousedown', this._voxelDown)
+        }
+        if (this._voxelMove) {
+          document.removeEventListener('mousemove', this._voxelMove)
+        }
+        if (this._voxelUp) {
+          document.removeEventListener('mouseup', this._voxelUp)
         }
       },
 
-      _handleVoxelClick(event) {
+      _getVoxelRaycaster(event) {
+        const ndc = screenToNDC(event, this.renderer)
+        const raycaster = new THREE.Raycaster()
+        raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), this.camera)
+        return raycaster
+      },
+
+      _handleVoxelMouseDown(event) {
+        if (event.button !== 0) return
         if (!this.selectedEntityId) {
           this.$message.warning('请先选择一个实体')
           return
@@ -1178,41 +1231,270 @@
           return
         }
 
+        this._voxelIsPainting = true
+        this._voxelPaintKeys = new Set()
+        this._voxelBrushData = []
+        this._voxelPaint(event)
+      },
+
+      _handleVoxelMouseMove(event) {
+        // 悬停始终更新预览
+        this._updateVoxelPreview(event)
+        // 拖拽中连续操作
+        if (this._voxelIsPainting) {
+          this._voxelPaint(event)
+        }
+      },
+
+      _handleVoxelMouseUp() {
+        if (!this._voxelIsPainting) return
+        this._voxelIsPainting = false
+
+        const editor = this._ensureVoxelEditor(this.selectedEntityId)
+        if (!editor) return
+        const brushData = this._voxelBrushData || []
+        this._voxelPaintKeys = null
+        this._voxelBrushData = []
+
+        if (brushData.length === 0) return
+
+        if (this.voxelEditType === 'place') {
+          const cmd = new VoxelPlaceCommand({
+            editor, worldPos: null, entityId: this.selectedEntityId, viewType: 'VoxelView',
+            _brushCells: brushData
+          })
+          this.viewEditUndoManager.execute(cmd)
+          this.$message.success(`笔刷放置了 ${brushData.length} 个体素`)
+          this.logOperation('voxel', `笔刷放置 ${this.selectedEntityId} ${brushData.length} 体素`)
+        } else {
+          const cmd = new VoxelBreakCommand({
+            editor, worldPos: null, entityId: this.selectedEntityId, viewType: 'VoxelView',
+            _brushCells: brushData
+          })
+          this.viewEditUndoManager.execute(cmd)
+          this.$message.success(`笔刷破坏了 ${brushData.length} 个体素`)
+          this.logOperation('voxel', `笔刷破坏 ${this.selectedEntityId} ${brushData.length} 体素`)
+        }
+      },
+
+      /**
+       * 执行一次体素操作（mousedown/拖拽时调用）
+       * 只修改 voxelGrid 并收集数据，重建延迟到 RAF
+       */
+      _voxelPaint(event) {
+        const editor = this._ensureVoxelEditor(this.selectedEntityId)
+        if (!editor) return
+        const raycaster = this._getVoxelRaycaster(event)
+
+        let target = null
+        if (this.voxelEditType === 'place') {
+          target = editor.getPlaceTarget(raycaster)
+          if (!target) return
+        } else {
+          target = editor.getBreakTarget(raycaster)
+          if (!target) return
+        }
+
+        const key = `${target.x},${target.y},${target.z}`
+        if (this._voxelPaintKeys.has(key)) return
+        this._voxelPaintKeys.add(key)
+
+        const oldValue = editor.setVoxel(target.x, target.y, target.z, this.voxelEditType === 'place')
+        this._voxelBrushData.push({ x: target.x, y: target.y, z: target.z, oldValue })
+
+        // RAF 合并重建，避免拖动时每帧多次重建
+        if (!this._voxelRebuildScheduled) {
+          this._voxelRebuildScheduled = true
+          requestAnimationFrame(() => {
+            this._voxelRebuildScheduled = false
+            const ed = this._ensureVoxelEditor(this.selectedEntityId)
+            if (ed) ed.rebuildMesh()
+          })
+        }
+      },
+
+      /**
+       * 悬停预览：更新绿色高亮框位置
+       * 注意：不要在这里直接 intersectObject 原始 GLB 网格——几十万三角形的
+       * 暴力射线检测在每次 mousemove 时调用会瞬间卡死主线程。
+       * getPlaceTarget/getBreakTarget 内部已改为体素网格 DDA 遍历，成本可忽略。
+       */
+      _updateVoxelPreview(event) {
+        const editor = this._ensureVoxelEditor(this.selectedEntityId)
+        if (!editor) return
+        const raycaster = this._getVoxelRaycaster(event)
+        const target = this.voxelEditType === 'place'
+          ? editor.getPlaceTarget(raycaster)
+          : editor.getBreakTarget(raycaster)
+        editor.updatePreviewBox(target)
+      },
+
+      // ---- 网格编辑（三角面删减 / 细分）----
+      _ensureMeshEditor(entityId) {
+        if (!entityId) return null
+        let editor = this.meshEditors[entityId]
+        if (!editor) {
+          editor = createMeshEditor(this, entityId)
+          if (editor) {
+            this.$set(this.meshEditors, entityId, editor)
+          }
+        }
+        return editor
+      },
+
+      enterMeshEditMode(type) {
+        // 点云/体素/网格编辑互斥
+        this.exitPointCloudEditMode()
+        this.exitVoxelEditMode()
+        this.meshEditMode = true
+        this.meshEditType = type
+        if (this.orbitControls) this.orbitControls.enabled = false
+        if (this.renderer && this.renderer.domElement) {
+          this.renderer.domElement.style.cursor = type === 'delete' ? 'crosshair' : 'copy'
+        }
+        // 预创建编辑器（首次提取面快照有一次性开销），隐藏原始 mesh 只显示编辑线框
+        if (this.selectedEntityId) {
+          const editor = this._ensureMeshEditor(this.selectedEntityId)
+          if (editor && editor.hideOriginal) editor.hideOriginal()
+          if (!editor) {
+            this.$message.warning('当前选中实体没有可编辑的网格视图，请先切换到 Grid View')
+          }
+        } else {
+          this.$message.warning('请先点击选择一个实体，再进行网格编辑')
+        }
+        this.$message.info(`网格${type === 'delete' ? '三角面删减（笔刷挖洞）' : '细分（笔刷加面）'}模式：按住拖拽操作`)
+        this._bindMeshMouseEvents()
+      },
+
+      exitMeshEditMode() {
+        if (!this.meshEditMode) return
+        this.meshEditMode = false
+        this._unbindMeshMouseEvents()
+        if (this.renderer && this.renderer.domElement) {
+          this.renderer.domElement.style.cursor = ''
+        }
+        // 退出编辑不恢复原始 mesh：editMesh（实体，含删面洞）继续替代显示
+        if (this.selectedEntityId) {
+          const editor = this.meshEditors[this.selectedEntityId]
+          if (editor && editor.clearHighlight) editor.clearHighlight()
+        }
+        if (this.orbitControls) this.orbitControls.enabled = true
+        this._meshIsPainting = false
+        this.$message.info('已退出网格编辑模式')
+      },
+
+      _bindMeshMouseEvents() {
+        if (!this.renderer) return
+        this._meshDown = this._handleMeshMouseDown.bind(this)
+        this._meshMove = this._handleMeshMouseMove.bind(this)
+        this._meshUp = this._handleMeshMouseUp.bind(this)
+        this.renderer.domElement.addEventListener('mousedown', this._meshDown)
+        document.addEventListener('mousemove', this._meshMove)
+        document.addEventListener('mouseup', this._meshUp)
+      },
+
+      _unbindMeshMouseEvents() {
+        if (!this.renderer) return
+        if (this._meshDown) {
+          this.renderer.domElement.removeEventListener('mousedown', this._meshDown)
+        }
+        if (this._meshMove) {
+          document.removeEventListener('mousemove', this._meshMove)
+        }
+        if (this._meshUp) {
+          document.removeEventListener('mouseup', this._meshUp)
+        }
+      },
+
+      _getMeshRaycaster(event) {
         const ndc = screenToNDC(event, this.renderer)
         const raycaster = new THREE.Raycaster()
         raycaster.setFromCamera(new THREE.Vector2(ndc.x, ndc.y), this.camera)
+        return raycaster
+      },
 
-        if (this.voxelEditType === 'place') {
-          // 在射线前方一点放置（避免与现有体素重叠）
-          const hit = editor.raycastVoxel(raycaster)
-          if (hit) {
-            const placePos = hit.worldPos.clone()
-            const result = executeVoxelPlace(this, this.selectedEntityId, placePos)
-            if (result) {
-              this.$message.success('放置体素')
-              this.logOperation('voxel', `放置 ${this.selectedEntityId} (${result.x},${result.y},${result.z})`)
-            }
-          } else {
-            // 如果没有命中，在射线与地面交点处放置
-            const groundHit = this._raycastGround(ndc)
-            if (groundHit) {
-              const result = executeVoxelPlace(this, this.selectedEntityId, groundHit)
-              if (result) {
-                this.$message.success('放置体素')
-                this.logOperation('voxel', `放置 ${this.selectedEntityId} (${result.x},${result.y},${result.z})`)
-              }
-            }
-          }
-        } else if (this.voxelEditType === 'break') {
-          const hit = editor.raycastVoxel(raycaster)
-          if (hit && editor.getVoxel(hit.x, hit.y, hit.z)) {
-            const result = executeVoxelBreak(this, this.selectedEntityId, hit.worldPos)
-            if (result && result.oldValue) {
-              this.$message.success('破坏体素')
-              this.logOperation('voxel', `破坏 ${this.selectedEntityId} (${result.x},${result.y},${result.z})`)
-            }
-          }
+      _handleMeshMouseDown(event) {
+        if (event.button !== 0) return
+        if (!this.selectedEntityId) {
+          this.$message.warning('请先选择一个实体')
+          return
         }
+        const editor = this._ensureMeshEditor(this.selectedEntityId)
+        if (!editor) {
+          this.$message.warning('该实体没有可编辑的网格视图，请先切换到 Grid View')
+          return
+        }
+
+        this._meshIsPainting = true
+        this._meshPaintFaces = new Set()
+        this._paintMeshAtMouse(event)
+      },
+
+      _handleMeshMouseMove(event) {
+        // 悬停始终更新预览
+        this._updateMeshPreview(event)
+        // 拖拽中连续操作
+        if (this._meshIsPainting) {
+          this._paintMeshAtMouse(event)
+        }
+      },
+
+      _handleMeshMouseUp() {
+        if (!this._meshIsPainting) return
+        this._meshIsPainting = false
+
+        const editor = this._ensureMeshEditor(this.selectedEntityId)
+        if (!editor) return
+        const faceIds = this._meshPaintFaces ? Array.from(this._meshPaintFaces) : []
+        this._meshPaintFaces = null
+
+        if (faceIds.length === 0) return
+
+        if (this.meshEditType === 'delete') {
+          const cmd = new MeshDeleteCommand({
+            editor, faceIds, entityId: this.selectedEntityId, viewType: 'GridView'
+          })
+          this.viewEditUndoManager.pushDirect(cmd, { affected: faceIds })
+          for (const fid of faceIds) {
+            pushMeshOp(this, this.selectedEntityId, 'delete_face', fid)
+          }
+          this.$message.success(`删减了 ${faceIds.length} 个三角面`)
+          this.logOperation('mesh', `三角面删减 ${this.selectedEntityId} ${faceIds.length} 面`)
+        } else {
+          const cmd = new MeshSubdivideCommand({
+            editor, faceIds, entityId: this.selectedEntityId, viewType: 'GridView'
+          })
+          this.viewEditUndoManager.pushDirect(cmd, { affected: faceIds })
+          for (const fid of faceIds) {
+            pushMeshOp(this, this.selectedEntityId, 'subdivide_face', fid)
+          }
+          this.$message.success(`细分了 ${faceIds.length} 个三角面`)
+          this.logOperation('mesh', `网格细分 ${this.selectedEntityId} ${faceIds.length} 面`)
+        }
+      },
+
+      _paintMeshAtMouse(event) {
+        const editor = this._ensureMeshEditor(this.selectedEntityId)
+        if (!editor) return
+        const raycaster = this._getMeshRaycaster(event)
+        const faceId = editor.raycastFace(raycaster)
+        if (faceId < 0) return
+        if (this._meshPaintFaces.has(faceId)) return
+        this._meshPaintFaces.add(faceId)
+
+        if (this.meshEditType === 'delete') {
+          editor.deleteFace(faceId)
+        } else {
+          editor.subdivideFace(faceId)
+        }
+      },
+
+      _updateMeshPreview(event) {
+        const editor = this._ensureMeshEditor(this.selectedEntityId)
+        if (!editor) return
+        const raycaster = this._getMeshRaycaster(event)
+        const faceId = editor.raycastFace(raycaster)
+        editor.highlightFace(faceId)
       },
 
       // Page close warning

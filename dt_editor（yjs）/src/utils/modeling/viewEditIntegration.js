@@ -1,12 +1,15 @@
 import * as Y from 'yjs'
 import { PointCloudEditor } from './PointCloudEditor'
 import { VoxelEditor } from './VoxelEditor'
+import { MeshEditor } from './MeshEditor'
 import {
   ViewEditUndoManager,
   PointCloudDeleteCommand,
   PointCloudAddCommand,
   VoxelPlaceCommand,
-  VoxelBreakCommand
+  VoxelBreakCommand,
+  MeshDeleteCommand,
+  MeshSubdivideCommand
 } from './ViewEditCommand'
 import { findOfficeViewObject } from './officeViewHelpers'
 
@@ -29,7 +32,18 @@ export function createVoxelEditor(vm, entityId) {
     console.warn(`[createVoxelEditor] 找不到 VoxelView Mesh: ${entityId}`)
     return null
   }
-  return new VoxelEditor(mesh, entityId)
+  const editor = new VoxelEditor(mesh, entityId, 32, vm.scene)
+  editor.createPreviewBox()
+  return editor
+}
+
+export function createMeshEditor(vm, entityId) {
+  const mesh = findOfficeViewObject(vm.objects, entityId, 'GridView')
+  if (!mesh) {
+    console.warn(`[createMeshEditor] 找不到 GridView Mesh: ${entityId}`)
+    return null
+  }
+  return new MeshEditor(mesh, entityId)
 }
 
 // ============================================
@@ -97,6 +111,36 @@ export function pushVoxelOp(vm, entityId, opType, x, y, z) {
   const op = {
     op: opType,
     x, y, z,
+    timestamp: Date.now()
+  }
+
+  vm.doc1.transact(() => {
+    ops.push([op])
+  })
+}
+
+/**
+ * 推送网格操作到 CRDT
+ * @param {VueComponent} vm
+ * @param {string} entityId
+ * @param {string} opType - 'delete_face' | 'subdivide_face'
+ * @param {number} faceId - 全局原始面 index（稳定标识）
+ */
+export function pushMeshOp(vm, entityId, opType, faceId) {
+  if (!vm.marsEntities || !vm.marsEntities.has(entityId)) return
+  const entityMap = vm.marsEntities.get(entityId)
+
+  // 确保 meshOps 存在（Y.Array）
+  let ops = entityMap.get('meshOps')
+  if (!(ops instanceof Y.Array)) {
+    ops = new Y.Array()
+    entityMap.set('meshOps', ops)
+  }
+
+  const op = {
+    opId: generateOpId(),
+    op: opType,
+    face: faceId,
     timestamp: Date.now()
   }
 
@@ -184,6 +228,34 @@ export function syncVoxelOpsFromCRDT(vm, entityId, operations) {
   editor.rebuildMesh()
 }
 
+/**
+ * 从 CRDT 同步网格操作到本地
+ * @param {VueComponent} vm
+ * @param {string} entityId
+ * @param {Array} operations
+ */
+export function syncMeshOpsFromCRDT(vm, entityId, operations) {
+  if (!vm.meshEditors) return
+  const editor = ensureMeshEditor(vm, entityId)
+  if (!editor) return
+
+  for (const op of operations) {
+    if (!op || !op.op) continue
+    try {
+      switch (op.op) {
+        case 'delete_face':
+          editor.deleteFace(op.face)
+          break
+        case 'subdivide_face':
+          editor.subdivideFace(op.face)
+          break
+      }
+    } catch (e) {
+      console.warn('[syncMeshOpsFromCRDT] 操作失败:', op, e)
+    }
+  }
+}
+
 // ============================================
 // 命令执行辅助（带 CRDT 同步 + 懒创建编辑器）
 // ============================================
@@ -211,6 +283,20 @@ function ensureVoxelEditor(vm, entityId) {
       vm.$set(vm.voxelEditors, entityId, editor)
     } else if (editor) {
       vm.voxelEditors[entityId] = editor
+    }
+  }
+  return editor
+}
+
+function ensureMeshEditor(vm, entityId) {
+  if (!entityId) return null
+  let editor = vm.meshEditors[entityId]
+  if (!editor) {
+    editor = createMeshEditor(vm, entityId)
+    if (editor && vm.$set) {
+      vm.$set(vm.meshEditors, entityId, editor)
+    } else if (editor) {
+      vm.meshEditors[entityId] = editor
     }
   }
   return editor
@@ -297,6 +383,42 @@ export function executeVoxelBreak(vm, entityId, worldPos) {
   return result
 }
 
+/**
+ * 执行网格删面命令并同步到 CRDT
+ */
+export function executeMeshDelete(vm, entityId, faceId) {
+  const editor = ensureMeshEditor(vm, entityId)
+  if (!editor || !vm.viewEditUndoManager) return null
+
+  const cmd = new MeshDeleteCommand({ editor, faceId, entityId, viewType: 'GridView' })
+  const result = vm.viewEditUndoManager.execute(cmd)
+
+  // 同步到 CRDT
+  if (result && result.affected && result.affected.length > 0) {
+    pushMeshOp(vm, entityId, 'delete_face', faceId)
+  }
+
+  return result
+}
+
+/**
+ * 执行网格细分命令并同步到 CRDT
+ */
+export function executeMeshSubdivide(vm, entityId, faceId) {
+  const editor = ensureMeshEditor(vm, entityId)
+  if (!editor || !vm.viewEditUndoManager) return null
+
+  const cmd = new MeshSubdivideCommand({ editor, faceId, entityId, viewType: 'GridView' })
+  const result = vm.viewEditUndoManager.execute(cmd)
+
+  // 同步到 CRDT
+  if (result && result.affected && result.affected.length > 0) {
+    pushMeshOp(vm, entityId, 'subdivide_face', faceId)
+  }
+
+  return result
+}
+
 // ============================================
 // 工具函数
 // ============================================
@@ -361,6 +483,11 @@ export function disposeViewEditors(vm) {
   }
   if (vm.voxelEditors) {
     Object.values(vm.voxelEditors).forEach(editor => {
+      if (editor && typeof editor.dispose === 'function') editor.dispose()
+    })
+  }
+  if (vm.meshEditors) {
+    Object.values(vm.meshEditors).forEach(editor => {
       if (editor && typeof editor.dispose === 'function') editor.dispose()
     })
   }
