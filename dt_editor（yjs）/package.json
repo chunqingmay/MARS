@@ -7,7 +7,12 @@
     "build": "vue-cli-service build",
     "experiment:mars": "node experiments/mars-sync-benchmark/runMarsYjs.cjs",
     "experiment:loro": "node experiments/mars-sync-benchmark/runLoro.cjs",
-    "experiment:mars-sync": "node experiments/mars-sync-benchmark/runComparison.cjs"
+    "experiment:mars-sync": "node experiments/mars-sync-benchmark/runComparison.cjs",
+    "experiment:independence": "node experiments/mars-paper-experiments/runner.cjs --exp 1",
+    "experiment:consistency": "node experiments/mars-paper-experiments/runner.cjs --exp 2",
+    "experiment:comparison": "node experiments/mars-paper-experiments/runner.cjs --exp 3",
+    "experiment:ablation": "node experiments/mars-paper-experiments/runner.cjs --exp 4",
+    "experiment:paper": "node experiments/mars-paper-experiments/runner.cjs --exp all"
   },
   "dependencies": {
     "axios": "^1.1.3",

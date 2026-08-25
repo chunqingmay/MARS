@@ -1,4 +1,4 @@
-node_modules/
+﻿node_modules/
 dist/
 .DS_Store
 serve_err.txt
@@ -13,3 +13,37 @@ yarn-error.log*
 .idea
 .vscode
 query
+
+# local experiment data (not for GitHub)
+data/
+
+# logs and temporary files
+*.log
+*.tmp
+~$*
+~WRL*.tmp
+
+# helper scripts
+scripts/
+
+# local tooling / agent / editor
+.claude/
+.dsh/
+.agents/
+skills/
+
+# python cache
+__pycache__/
+*.pyc
+
+# generated / third-party
+archify/
+crdt-benchmarks-main/
+
+# generated experiment outputs
+**/mars-paper-experiments/results*/
+**/mars-paper-experiments/paper-tables.md
+**/mars-sync-benchmark/results/
+
+# docs (not for GitHub)
+docs/
